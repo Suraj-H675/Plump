@@ -1,5 +1,8 @@
 # Local planning, source packs, design studies and evidence (never public).
 .plump-private/
+
+# Native cores are generated from pinned upstream source. Never commit .so files.
+app/src/main/jniLibs/
 .local/
 *.local.md
 *.local.json

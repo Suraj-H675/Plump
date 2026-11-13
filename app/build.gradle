@@ -1,0 +1,56 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'dev.plump.emulator'
+    compileSdk 35
+    ndkVersion '28.2.13676358'
+
+    defaultConfig {
+        applicationId 'dev.plump.emulator'
+        minSdk 26
+        targetSdk 35
+        versionCode 1
+        versionName '0.1.0-p2'
+        ndk { abiFilters 'arm64-v8a' }
+        externalNativeBuild {
+            cmake {
+                cppFlags '-std=c++17 -Wall -Wextra'
+            }
+        }
+    }
+
+    buildTypes {
+        release { minifyEnabled false }
+    }
+
+    packaging {
+        jniLibs { useLegacyPackaging true }
+    }
+
+    externalNativeBuild {
+        cmake { path 'src/main/cpp/CMakeLists.txt'; version '3.22.1' }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    testOptions {
+        unitTests.all {
+            // The host's /tmp may have a per-user quota. Test files must be
+            // owned by the build, not by the emulator's device-save storage.
+            def testTemp = file("${buildDir}/unit-test-tmp")
+            // Create at execution time: :app:clean removes build/ after
+            // Gradle's configuration phase, otherwise the directory vanishes.
+            doFirst { testTemp.mkdirs() }
+            systemProperty 'java.io.tmpdir', testTemp.absolutePath
+        }
+    }
+}
+
+dependencies {
+    testImplementation 'junit:junit:4.13.2'
+}

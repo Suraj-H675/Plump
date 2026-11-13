@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.22.1)
+project(plump_host LANGUAGES CXX)
+add_library(plump_host SHARED plump_host.cpp)
+target_compile_features(plump_host PRIVATE cxx_std_17)
+target_link_libraries(plump_host PRIVATE android log dl)

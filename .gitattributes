@@ -1,0 +1,4 @@
+# Gradle's generated Windows launcher retains CRLF in the checkout while
+# Git stores normalized text so patch review remains whitespace-clean.
+gradlew text eol=lf
+gradlew.bat text eol=crlf
