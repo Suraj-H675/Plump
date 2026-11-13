@@ -4,7 +4,7 @@ Genuine melonDS reads/writes Nintendo DS AUX SPI during execution of our own
 synthetic retail-classified CC0 ARM9 diagnostic. Forcing this classification
 is a bounded save-adapter test, NOT evidence of retail game compatibility.
 
-Usage: python3 verify-p3-native-save-diagnostic.py first|cold CORE ROM WORKDIR
+Usage: python3 verify-p3-native-save-diagnostic.py first|cold|state-rewind CORE ROM WORKDIR
 """
 
 import ctypes as ct
@@ -38,8 +38,8 @@ class Variable(ct.Structure):
     _fields_ = [('key', ct.c_char_p), ('value', ct.c_char_p)]
 
 
-if len(sys.argv) != 5 or sys.argv[1] not in ('first', 'cold'):
-    raise SystemExit('first|cold CORE_SO SYNTHETIC_NDS WORKDIR arguments required')
+if len(sys.argv) != 5 or sys.argv[1] not in ('first', 'cold', 'state-rewind'):
+    raise SystemExit('first|cold|state-rewind CORE_SO SYNTHETIC_NDS WORKDIR arguments required')
 stage = sys.argv[1]
 rom_file = Path(sys.argv[3]).resolve()
 rom = rom_file.read_bytes()
@@ -133,7 +133,7 @@ def poll():
 
 @Input
 def input_state(port, device, index, key):
-    return int(stage == 'first' and port == 0 and device == 1 and index == 0 and
+    return int(stage != 'cold' and port == 0 and device == 1 and index == 0 and
                key == 8 and 115 <= frame_no[0] < 128)
 
 
@@ -180,9 +180,33 @@ try:
     core.retro_get_system_av_info(ct.byref(av))
     assert (av.geometry.width, av.geometry.height) == (256, 384)
 
+    if stage == 'state-rewind':
+        core.retro_serialize_size.restype = ct.c_size_t
+        core.retro_serialize.argtypes = [ct.c_void_p, ct.c_size_t]
+        core.retro_serialize.restype = ct.c_bool
+        core.retro_unserialize.argtypes = [ct.c_void_p, ct.c_size_t]
+        core.retro_unserialize.restype = ct.c_bool
+
     for n in range(220):
         frame_no[0] = n
         core.retro_run()
+        if stage == 'state-rewind' and n == 90:
+            state_size = core.retro_serialize_size()
+            assert 0 < state_size < 128 * 1024 * 1024
+            saved_state = ct.create_string_buffer(state_size)
+            assert core.retro_serialize(saved_state, state_size)
+            print('DS state serialized before in-game EEPROM write:', state_size, 'bytes', flush=True)
+        if stage == 'state-rewind' and n == 170:
+            before = ct.string_at(memory, length)[0x180:0x190]
+            assert before == bytes.fromhex('504c4d502d44533301feac5301020304')
+            assert core.retro_unserialize(saved_state, state_size), 'Libretro rejected the older state'
+            after = ct.string_at(memory, length)[0x180:0x190]
+            print('Save-state rollback: EEPROM before=', before.hex(),
+                  'EEPROM after=', after.hex(), flush=True)
+            assert after == bytes(16), 'Pinned core state did not rewind cartridge EEPROM as expected'
+            print('PASS STATE SAFETY: loading an older DS state erased newer in-memory EEPROM;',
+                  'Plump MUST keep DS state loading disabled pending native-save protection.', flush=True)
+            raise SystemExit(0)  # finally unloads the isolated host core
 
     assert frames[0] >= 210 and input_polls[0] >= 210
     current = ct.string_at(memory, length)

@@ -53,6 +53,16 @@ save handling, additional safe-area layouts, supported save-state behavior,
 multi-title compatibility and sustained performance remain unverified.** See
 [P3 technical report](docs/P3_TECHNICAL_REPORT.md).
 
+**Uninstalled P3 version-6 candidate:** `0.2.1-p3-layout-measure` adds an
+inset-safe responsive DS layout, core-frame p95/p99 instrumentation, measured
+emulated FPS and audio-underrun counters. Twenty-four JVM tests and three
+Python performance-log parser tests pass. The pinned DS core also proved why
+state loading must remain disabled: loading an older state directly rewound
+the newer synthetic cartridge EEPROM. A read-only device measurement script
+is prepared, but **no version-6 install or sustained phone benchmark has
+been authorized or performed**. The DS engine-change save workflow is still
+open for mastermind review.
+
 ## P2 development build (Android ARM64 only)
 
 Install Android SDK platform 35, Build Tools 35.0.0, NDK 28.2.13676358,
@@ -97,6 +107,7 @@ export TMPDIR="$PWD/app/build/p3-tmp"
 ./scripts/test-p3-native-save-diagnostic.sh
 ./scripts/test-nds-frame-split.sh
 ./scripts/test-rgb565-renderer.sh
+python3 -m unittest tests/device/test_parse_p3_performance.py
 ./gradlew --no-daemon :app:assembleDebug :app:testDebugUnitTest :app:lintDebug
 ```
 

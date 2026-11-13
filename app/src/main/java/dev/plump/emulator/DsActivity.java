@@ -30,6 +30,7 @@ import java.security.NoSuchAlgorithmException;
 import java.util.Arrays;
 import java.util.Locale;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.LockSupport;
 
 /** P3 technical slice: two real DS screens; isolated from the accepted GBA host. */
@@ -37,16 +38,19 @@ public final class DsActivity extends Activity {
     private static final int REQUEST_ROM = 63;
     private static final int MAX_ROM = 64 * 1024 * 1024;
     private final AtomicBoolean running = new AtomicBoolean();
+    private final AtomicInteger audioUnderruns = new AtomicInteger();
     private Thread emulatorThread, audioThread;
     private DsControlsView left, right;
     private TouchPanel bottom;
-    private LinearLayout screenRow, extraControls;
+    private SurfaceView topDisplay;
+    private LinearLayout screenRow, extraControls, portraitRoot;
     private Button pauseButton, expandButton;
     private TextView status;
     private GameSaveStore saveStore;
     private String gameId;
     private long frames, lastStats;
     private boolean coreReady, loaded, userPaused, foreground, enlarged;
+    private int measuredContentWidth, measuredContentHeight;
 
     private int dp(float value) { return (int) (getResources().getDisplayMetrics().density * value + .5f); }
     private void message(String message) { status.setText(message); }
@@ -99,6 +103,7 @@ public final class DsActivity extends Activity {
         getWindow().setNavigationBarColor(Color.BLACK);
 
         LinearLayout root = new LinearLayout(this);
+        portraitRoot = root;
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(Color.rgb(16, 19, 23));
         root.setFitsSystemWindows(true);
@@ -127,6 +132,7 @@ public final class DsActivity extends Activity {
                 setMeasuredDimension(width, width * 192 / 256);
             }
         };
+        topDisplay = top;
         top.setContentDescription("Nintendo DS upper 256 by 192 display");
         root.addView(top, new LinearLayout.LayoutParams(-1, -2));
         top.getHolder().addCallback(new SurfaceHolder.Callback() {
@@ -145,6 +151,7 @@ public final class DsActivity extends Activity {
         screenRow = new LinearLayout(this);
         screenRow.setOrientation(LinearLayout.HORIZONTAL);
         screenRow.setMotionEventSplittingEnabled(true);
+        screenRow.setGravity(Gravity.CENTER_HORIZONTAL);
         bottom = new TouchPanel();
         left = new DsControlsView(this, true, this::sendButtons);
         right = new DsControlsView(this, false, this::sendButtons);
@@ -155,10 +162,18 @@ public final class DsActivity extends Activity {
         extraControls = new LinearLayout(this);
         extraControls.setOrientation(LinearLayout.HORIZONTAL);
         extraControls.setMotionEventSplittingEnabled(true);
+        extraControls.setVisibility(View.GONE);
         root.addView(extraControls);
         setContentView(root);
 
-        root.post(() -> updateLowerLayout(root.getWidth()));
+        root.addOnLayoutChangeListener((view, l, t, r, b, oldL, oldT, oldR, oldB) -> {
+            int width = r - l, height = b - t;
+            if (width > 0 && height > 0 &&
+                    (width != measuredContentWidth || height != measuredContentHeight)) {
+                updateLowerLayout(width, height);
+            }
+        });
+        root.post(() -> updateLowerLayout(root.getWidth(), root.getHeight()));
         bottom.getHolder().addCallback(new SurfaceHolder.Callback() {
             @Override public void surfaceCreated(SurfaceHolder holder) { if (coreReady) NativeDs.bottomSurface(holder.getSurface()); }
             @Override public void surfaceChanged(SurfaceHolder holder, int format, int w, int h) {
@@ -202,19 +217,31 @@ public final class DsActivity extends Activity {
         }
     }
 
-    private void updateLowerLayout(int width) {
-        if (width <= 0) return;
+    private void updateLowerLayout(int width, int height) {
+        if (width <= 0 || height <= 0) return;
+        measuredContentWidth = width;
+        measuredContentHeight = height;
+        DsPortraitSizing.Panels panels = DsPortraitSizing.calculate(
+                width, height, dp(56), dp(43), dp(130), enlarged);
         bottom.release();
         left.releaseAll();
         right.releaseAll();
+        LinearLayout.LayoutParams topParams = new LinearLayout.LayoutParams(
+                panels.topWidth, panels.topHeight());
+        topParams.gravity = Gravity.CENTER_HORIZONTAL;
+        topDisplay.setLayoutParams(topParams);
         if (enlarged) {
             if (left.getParent() == screenRow) screenRow.removeView(left);
             if (right.getParent() == screenRow) screenRow.removeView(right);
             if (left.getParent() != extraControls) {
-                extraControls.addView(left, new LinearLayout.LayoutParams(0, dp(130), 1f));
-                extraControls.addView(right, new LinearLayout.LayoutParams(0, dp(130), 1f));
+                extraControls.addView(left, new LinearLayout.LayoutParams(0, panels.controlsHeight, 1f));
+                extraControls.addView(right, new LinearLayout.LayoutParams(0, panels.controlsHeight, 1f));
             }
-            bottom.setLayoutParams(new LinearLayout.LayoutParams(width, width * 3 / 4));
+            extraControls.setVisibility(View.VISIBLE);
+            left.setLayoutParams(new LinearLayout.LayoutParams(0, panels.controlsHeight, 1f));
+            right.setLayoutParams(new LinearLayout.LayoutParams(0, panels.controlsHeight, 1f));
+            bottom.setLayoutParams(new LinearLayout.LayoutParams(
+                    panels.lowerWidth, panels.lowerHeight()));
         } else {
             if (left.getParent() == extraControls) extraControls.removeView(left);
             if (right.getParent() == extraControls) extraControls.removeView(right);
@@ -222,11 +249,13 @@ public final class DsActivity extends Activity {
                 screenRow.addView(left, 0);
                 screenRow.addView(right);
             }
-            int lowerWidth = (int) (width * .62f);
-            int height = lowerWidth * 3 / 4;
-            left.setLayoutParams(new LinearLayout.LayoutParams((width - lowerWidth) / 2, height));
-            bottom.setLayoutParams(new LinearLayout.LayoutParams(lowerWidth, height));
-            right.setLayoutParams(new LinearLayout.LayoutParams(width - lowerWidth - (width - lowerWidth) / 2, height));
+            extraControls.setVisibility(View.GONE);
+            int sideWidth = (width - panels.lowerWidth) / 2;
+            left.setLayoutParams(new LinearLayout.LayoutParams(sideWidth, panels.lowerHeight()));
+            bottom.setLayoutParams(new LinearLayout.LayoutParams(
+                    panels.lowerWidth, panels.lowerHeight()));
+            right.setLayoutParams(new LinearLayout.LayoutParams(
+                    width - panels.lowerWidth - sideWidth, panels.lowerHeight()));
         }
         sendButtons();
     }
@@ -234,7 +263,7 @@ public final class DsActivity extends Activity {
     private void changeLowerSize() {
         enlarged = !enlarged;
         expandButton.setText(enlarged ? "Restore lower screen" : "Enlarge lower screen");
-        updateLowerLayout(screenRow.getWidth());
+        if (portraitRoot != null) updateLowerLayout(portraitRoot.getWidth(), portraitRoot.getHeight());
     }
 
     private void sendButtons() {
@@ -331,30 +360,35 @@ public final class DsActivity extends Activity {
 
     private void start() {
         if (!loaded || !coreReady || !foreground || userPaused || !running.compareAndSet(false, true)) return;
+        lastStats = SystemClock.elapsedRealtime();
+        audioUnderruns.set(0);
         emulatorThread = new Thread(() -> {
             long period = (long) (1_000_000_000.0 / NativeDs.rate());
             long deadline = System.nanoTime();
             long previousSave = SystemClock.elapsedRealtime();
-            long sumFrameNs = 0;
-            long maximumFrameNs = 0;
-            int measured = 0;
+            DsFrameTiming timings = new DsFrameTiming();
             while (running.get()) {
                 long start = System.nanoTime();
                 NativeDs.frame();
                 long frameNs = System.nanoTime() - start;
-                sumFrameNs += frameNs;
-                maximumFrameNs = Math.max(maximumFrameNs, frameNs);
+                timings.record(frameNs);
                 ++frames;
-                ++measured;
                 long now = SystemClock.elapsedRealtime();
                 if (now - lastStats > 3000) {
+                    long intervalMs = now - lastStats;
                     lastStats = now;
-                    String metrics = NativeDs.stats() + " avgCore=" + (sumFrameNs / Math.max(1, measured) / 1_000_000) +
-                            "ms peakCore=" + maximumFrameNs / 1_000_000 + "ms";
+                    String metrics = NativeDs.stats() +
+                            " measuredFps=" + String.format(Locale.ROOT, "%.2f",
+                                timings.count() * 1000.0 / intervalMs) +
+                            " targetFps=" + String.format(Locale.ROOT, "%.2f", NativeDs.rate()) +
+                            " avgCore=" + timings.averageMillis() +
+                            "ms peakCore=" + timings.peakMillis() +
+                            "ms p95Core=" + timings.percentileMillis(95) +
+                            "ms p99Core=" + timings.percentileMillis(99) +
+                            "ms audioUnderruns=" + audioUnderruns.get();
                     android.util.Log.i("PlumpDS", metrics);
                     runOnUiThread(() -> { if (loaded && !userPaused) message("DS " + metrics); });
-                    measured = 0;
-                    sumFrameNs = maximumFrameNs = 0;
+                    timings.reset();
                 }
                 if (now - previousSave >= 30_000) {
                     save(false);
@@ -386,7 +420,13 @@ public final class DsActivity extends Activity {
             if (output.getState() != AudioTrack.STATE_INITIALIZED) throw new IllegalStateException("AudioTrack unavailable");
             output.play();
             short[] samples = new short[2048];
+            long lastUnderrunSample = SystemClock.elapsedRealtime();
             while (running.get()) {
+                long now = SystemClock.elapsedRealtime();
+                if (now - lastUnderrunSample >= 1000) {
+                    audioUnderruns.set(output.getUnderrunCount());
+                    lastUnderrunSample = now;
+                }
                 int size = NativeDs.drain(samples);
                 if (size == 0) { SystemClock.sleep(5); continue; }
                 int written = 0;

@@ -263,18 +263,21 @@ unconditionally accepted.
 | DS-03 touchscreen tap/drag | Host marker correct at three exact DS coordinates, owner verified taps, drag and X/Y updates on phone | **Fixture-level physical pass** |
 | DS-04 concurrent touch and buttons | Host and phone both verified A+B while lower stylus marker stays active | **Fixture-level physical pass** |
 | DS-05 lower enlargement | Owner confirmed correct finger-marker alignment before and after lower enlargement | **Fixture-level physical pass** |
-| DS-06 layouts/insets | 4 lower display widths exercised in JVM tests; Android `fitsSystemWindows` set | **3 real layouts, safe areas and accessibility pending** |
+| DS-06 layouts/insets | Owner saw default and expanded portrait; new version-6 adaptive layout fits available inset-safe content height in 5 JVM sizing tests across iQOO, compact, wide and short viewports | **Geometry tested; revised APK not yet installed or physically validated in 3 cases** |
 | DS-07 native save persistence | Synthetic DS SPI EEPROM write, two valid Android save generations, force-stop/cold relaunch and core readback plus game showing `RESTORED`, counter 1 | **Phone fixture cold-save pass; engine-change workflow and other cartridges pending** |
-| DS-08 save states | No DS save-state UI or serializing JNI exposed; no false save-state claims | **Not implemented; future P3 decision** |
+| DS-08 save states | Host serialization succeeded for synthetic DS cart (19,228,045 bytes), but restoring pre-write state **reverted newer EEPROM to all zero**; no state load UI/JNI offered | **Deliberately disabled due demonstrated loss risk; requires future guarded state design** |
 | DS-09 DSi | Forced DS mode; no licensed DSi BIOS/firmware/NAND | **Not implemented; explicit gaps below** |
 | Audio and lifecycle | Owner verified Pause/Resume, Home/Recents and audible PSG while holding A, which stops when released | **Fixture-level physical pass; extended synchronization pending** |
-| Performance | Actual device screen showed 1,443/1,443 posted, zero rejected, average/peak 8/17 ms core time | **Short interval observed; sustained pacing unverified** |
+| Performance | Version-5 actual device screen: 1,443/1,443 frames, zero rejected, average/peak 8/17ms core. Version-6 local candidate adds measured FPS, 1ms-bucket p95/p99 core timing, audio-underrun count, plus read-only device measurement script | **Short interval observed; new telemetry and sustained test not yet verified on phone** |
 | GBA regression | mGBA native core and `native-saves` directory unchanged; host GBA pixel test, existing save/button JVM tests and APK build pass | **Source/build regression check only; device retest pending** |
 
-**Test counts:** 16 JVM tests pass (7 native-save integrity, 3 GBA pointer
-state, 3 DS touch geometry, 3 DS button geometry); host pixel split and
+**Original version-5 test counts:** 16 JVM tests pass (7 native-save integrity,
+3 GBA pointer state, 3 DS touch geometry, 3 DS button geometry). The local
+version-6 candidate adds 5 responsive geometry tests and 3 frame-latency
+tests for **24 JVM tests**, and 4 separate Python device-log-parser tests.
+Host pixel split and
 GBA RGB565 tests pass. Gradle `assembleDebug`, `testDebugUnitTest`, `lintDebug`
-pass. Lint has no blocking findings. The APK contains both ARM64 cores; it
+pass. Lint has nonblocking diagnostic/compatibility warnings. The APK contains both ARM64 cores; it
 includes **no ROM, BIOS, NAND or proprietary game files**. Upstream GPL code
 and asset notices must be reviewed before any public binary distribution.
 
@@ -320,10 +323,11 @@ app-private backup verification. Installed identity:
   requests no Android permissions.
 - APK path relative to the canonical checkout:
   `app/build/outputs/apk/debug/app-debug.apk`.
-  Current final build SHA-256:
+  **Historical installed version-5 build** SHA-256:
   `55d1d8b8fb344213836ed797d7f669917c242ad5e18554849a7b8808f9f89489`.
-  This hash was checked against the installed approved APK; reverify before
-  any future separately authorized install and abort if it differs.
+  This hash was checked before its approved install. The current local
+  `app/build/outputs/apk/debug/app-debug.apk` is now a **distinct version-6
+  candidate**, and must never be mistaken for that older installed APK.
 - Pre-update installed version was P2 `0.1.3-p2-sram-verify` (code 4).
   Installed version after the scoped update is code 5. The P2 test-save
   backup and post-install hashes matched for all eight existing files.
@@ -347,6 +351,128 @@ it is available in the same isolated P3 folder. The current homebrew content
 does **not** exercise native cartridge SRAM cold persistence. There were no
 automated phone taps, private ROM/firmware reads or proprietary-file downloads.
 Any new APK update after this first device experiment requires separate approval.
+
+## P3 bounded closure investigation — layout, states, engine updates and performance
+
+### Version-6 local portrait-safe layout and telemetry
+
+Code `6`, `0.2.1-p3-layout-measure` is **built locally only**, not installed
+or authorized for installation. It retains the approved top/lower portrait
+composition, separate DS 4:3 surfaces and independent lower touchscreen.
+The signed debug APK is a **candidate, not a release**:
+
+```text
+Project-relative path: app/build/outputs/apk/debug/app-debug.apk
+Package: dev.plump.emulator
+versionCode: 6
+versionName: 0.2.1-p3-layout-measure
+ABI: arm64-v8a
+Length: 2,865,330 bytes
+SHA-256: 71aed3148a7b08627176e9cb5a74480c6f13184fb2b402e417283e6ea4a71795
+```
+
+Its APK signature verified; no Android permissions, ROM, BIOS, firmware or
+personal source files are bundled. The *currently installed* Plump on the
+phone remains **version code 5** with its tested native saves untouched.
+Any authorized future install must recheck the precise APK identity/hash and
+first preserve private GBA **and** DS journal generations.
+`DsPortraitSizing` now measures the space **after Android system/cutout
+insets**, leaves room for the toolbar and controls, and scales the panels
+without distorting their native aspect ratios when the enlarged bottom panel
+would otherwise run off-screen. Top remains larger by default; enlarged mode
+prioritizes bottom touch readability and can shrink the top as needed. The
+user-approved lower enlargement affordance and control grouping remain.
+
+Five JVM layout tests verify geometry and midpoint touch mapping for the
+observed iQOO Neo 6 native screen (1080×2400, 440dpi), an inset-safe content
+area, a compact phone, a wide/high-density phone, and very short content.
+This is **mathematical/host validation only** until the owner approves a new
+APK test and physically checks multiple touch-safe layouts on the target.
+
+`DsFrameTiming` collects bounded, allocation-free 1ms latency buckets
+with p95/p99 and max (64ms+ grouped in the last bucket). The DS runner now
+reports **measured emulator FPS versus the actual melonDS core FPS** and
+Android AudioTrack underruns alongside the existing posted/rejected counters.
+Three JVM timing tests and four independent Python log-parser tests passed.
+`scripts/measure-p3-device.sh` is a read-only, fail-closed 60–600s ADB
+measurement: it requires Plump DS already in the foreground and never opens
+a ROM, sends taps, changes system configuration or clears global logcat. It
+captures only the Plump process's log tag, app memory and battery/temperature
+metadata. The parser measures actual frame-counter/time deltas, rather than
+interpreting a hardcoded 60fps as real performance. It reports explicitly
+that core timing is **not GPU presentation latency or acoustic audio sync**.
+
+No sustained real-device run has been performed with the version-6 candidate.
+The phone was running another app during the preflight check; the measurement
+script correctly rejected the session instead of interfering with it.
+
+### State capability and proven native-save rollback hazard
+
+The pinned core exposes working `retro_serialize_size` and `retro_serialize`
+for the **synthetic DS cartridge**: host serialized 19,228,045 bytes. A third
+independent synthetic host session in
+`scripts/test-p3-native-save-diagnostic.sh` demonstrated a critical hazard:
+
+```text
+DS state serialized before in-game EEPROM write: 19228045 bytes
+Save-state rollback:
+  EEPROM before=504c4d502d44533301feac5301020304
+  EEPROM after =00000000000000000000000000000000
+PASS STATE SAFETY: loading an older DS state erased newer in-memory EEPROM
+```
+
+The state restores successfully but **rewinds cartridge memory to its old
+value**; a subsequent autosave could overwrite current progress. Plump's DS
+frontend consequently exposes **no manual/automatic save-state creation or
+loading** while it lacks a tested native-save snapshot, conflict choice,
+compatibility manifest, and rollback-safe transaction. Native in-game saves
+still work independently. This is an explicit *safe disabled state*, **not**
+a claim that DS save states are implemented. The pinned core separately
+documents unsafe homebrew virtual-SD state limitations and unavailable DSi
+serialization. State-system feature completion belongs to mastermind/P4
+review, without weakening the P3 `DS-08` truthfulness requirement.
+
+### Engine-change/save-update workflow — still unverified
+
+The current `GameSaveStore` isolates DS native saves by ROM SHA-256 and
+two protected journal generations, independent of GBA, and the synthetic
+8KB cartridge's normal force-stop/cold-load path passed on the phone. An
+**actual change to a different melonDS engine revision or save format has
+not been performed**. A safe future upgrade must:
+
+1. Preserve **both** original per-game generations in a private, externally
+   verified backup and record original core revision, ROM ID and payload
+   hashes, without touching unrelated personal games or saves.
+2. Stage the proposed core/version in a separate test-only context and
+   confirm `RETRO_MEMORY_SAVE_RAM` size/format and cold byte-exact readback;
+   use licensed diagnostic content and exercise a real in-game read.
+3. Confirm new saves cannot replace the last good old-engine generation
+   before candidate validation. Include failed-upgrade and rollback cases.
+4. If incompatible, keep the old journal, report the incompatibility and
+   offer native-save/old-engine fallback **only when verified**; never silently
+   rewrite schema metadata or auto-import a savestate.
+
+This is a **proposed gate/runbook**, not an implemented migration or an
+approval to replace the chosen core. The mastermind must decide how to stage
+and accept a future engine update. DS-07's upgrade aspect is still open.
+
+### Remaining P3 acceptance obligations
+
+- Run controlled version-6 installation **only after fresh, explicitly scoped
+  permission**, with pre-update hashes/backups of P2 GBA saves **and** DS
+  fixture save generations; use `adb install -r`, never uninstall/clear.
+- Verify at least three actual panel/safe-area combinations and tap/drag
+  mapping, including expanded controls on the iQOO Neo 6; rerun GBA smoke
+  rendering, buttons, audio and SRAM restore after the update.
+- Measure >=3 minutes of real DS fixture speed, p95/p99 core timing,
+  audio underruns, posted/rejected frames, app PSS and battery temperature;
+  collect sustained/thermal evidence on a representative load before any
+  broader performance or compatibility claim.
+- Complete a separately reviewed engine-update/save compatibility experiment,
+  or request an explicit mastermind decision on P3's scope/acceptance. Do not
+  manufacture a pass by repeating the same engine's cold-load test.
+- Keep DSi and unprotected homebrew SD persistence documented as capability
+  gaps. No 3DS work, private ROM access, or UI polishing is authorized here.
 
 ## Milestone recommendation to mastermind
 

@@ -1,6 +1,6 @@
 # Plump development status
 
-Last documented: 2026-11-13 (P2 accepted; P3 fixture-level physical DS input/audio and DS EEPROM force-stop/cold-restart verified; P3 acceptance pending).
+Last documented: 2026-11-13 (P2 accepted; P3 phone dual-screen/input/audio/save verified at fixture level; local version-6 layout/performance preparation and state-safety proof; mastermind acceptance pending).
 
 | Area | Status |
 |---|---|
@@ -8,13 +8,13 @@ Last documented: 2026-11-13 (P2 accepted; P3 fixture-level physical DS input/aud
 | Home/library concept | Provisional user approval; local OpenPencil editable design |
 | GBA and DS portrait concept | GBA sketch implementation device-tested in P2; DS dual-screen portrait layout, controls flanking lower panel, and enlargement visually verified on phone with one licensed test ROM |
 | Emulator core selections | P1 mGBA Libretro accepted; P3 uses pinned melonDS DS Libretro software renderer as a testable candidate, not a final architecture decision |
-| Android build/APK | ARM64 `0.2.0-p3-ds-spike` (code 5) installed on iQOO Neo 6 (Android 14), with all eight existing P2 save/recovery files byte-identical after upgrade; accepted P2 code retained |
+| Android build/APK | ARM64 `0.2.0-p3-ds-spike` (code 5) installed on iQOO Neo 6 (Android 14), all eight existing P2 save/recovery files preserved. Distinct local **version-6** portrait-fit/performance APK compiles, **not installed or authorized for phone update** |
 | Real game execution | Owner verified real `hello.gba` and `sram.gba` in P2; in P3, genuine GPL NDS memory-test game displayed both screens with expected START shutdown. Owner verified interactive CC0 touch/drag, A+B+stylus and audible PSG on phone; synthetic DS EEPROM diagnostic was also executed on phone |
-| Actual phone performance | P3 owner screenshot reports 1,443 posted of 1,443 DS frames, zero rejected, 8-ms average/17-ms maximum core time for a short test interval. Sustained performance/thermal pacing unmeasured |
+| Actual phone performance | Installed P3 v5 screenshot: 1,443/1,443 frames posted, zero rejected, short interval 8-ms average/17-ms maximum core time. Local v6 adds measured target FPS, p95/p99 core timings and AudioTrack underrun counts; read-only device benchmark helper is tested but sustained phone sampling remains unmeasured |
 | Save and recovery integrity | P2 GBA 32-KiB SRAM cold restore and one-corrupted-generation fallback device-verified. P3 synthetic DS 8-KiB EEPROM recorded two SHA-256-valid generations, survived Plump-only force-stop and cold launch, was byte-verified in melonDS as generation 2, and genuinely displayed restored in-game counter 1; DS engine change/other chip types untested |
 | Offline operation | Manifest declares no Internet permission and excludes platform backups; runtime offline behavior still unverified |
 | GitHub remote | Existing public Suraj-H675/Plump; accepted P2 batch pushed at `d1cef15`; P3 local only |
-| Local development | P2 GBA accepted; pinned melonDS DS Android/host core built. Owner confirmed CC0 DS touch+chord+PSG tests on phone. Separate CC0 **synthetic retail-classified** EEPROM test performed genuine 8-KB DS SPI write/read, two-process host cold load, and phone cold app restart with intact native save journal |
+| Local development | P2 GBA accepted; pinned melonDS DS Android/host core built. Owner confirmed CC0 DS touch+chord+PSG tests on phone and synthetic DS EEPROM cold restart. Local DS sizing tests cover five cases; 24 JVM tests pass. Host state rollback reproduction proves an older serialized DS state can erase newer in-memory EEPROM; all DS state UI remains intentionally disabled pending durable native-save protection. Engine-update workflow not yet verified |
 
 The owner authorized initial installation of APK SHA-256
 `93b3fa9e4fbe2dd398f388c0bc72c9b2f96e652d8460a6217ee73825c72da612`
