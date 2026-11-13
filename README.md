@@ -27,13 +27,22 @@ PSG tone response, and recovery of an older cartridge-save generation after a
 newer disposable generation's checksum was deliberately damaged. See
 [P2 device-test report](docs/P2_DEVICE_TEST_REPORT.md). **Long-running audio
 synchronization, performance, broad game compatibility, crash-hardening and
-product-quality UX are not yet verified.** This is not product-ready and P2
+product-quality UX are not yet verified.** This is not product-ready.
 The accepted P2 HEAD `d1cef15` was pushed to the existing public source
 repository; no APK was released. **P3 DS work is a local unaccepted technical
 slice**: a pinned melonDS DS software core built for Android ARM64, and the
 same core executed an upstream-licensed DS homebrew test on the development
-computer. An Android dual-screen candidate compiles, but is **not installed or
-verified on the phone**. See [P3 technical report](docs/P3_TECHNICAL_REPORT.md).
+computer. Android DS APK `0.2.0-p3-ds-spike` (code 5) **is installed on the
+owner's phone** under a separate scoped approval, with all eight preexisting
+Plump save/recovery files preserved and hash-checked. The owner verified real
+dual-screen output, lower enlargement, pause/resume, Android background return,
+and normal START-controlled test-ROM power-off. A new CC0 interactive DS
+homebrew fixture passed host checks for exact stylus coordinates, simultaneous
+A+B+stylus and native PSG tone samples; the generated ROM was transferred
+to the existing isolated P3 fixture folder, awaiting real phone interaction.
+**P3 is not accepted**: physical stylus accuracy, simultaneous input,
+audible DS sound, native DS cartridge save recovery, and sustained performance
+remain unverified. See [P3 technical report](docs/P3_TECHNICAL_REPORT.md).
 
 ## P2 development build (Android ARM64 only)
 
@@ -75,6 +84,7 @@ export ANDROID_SDK_ROOT="$ANDROID_HOME"
 export TMPDIR="$PWD/app/build/p3-tmp"
 ./scripts/build-melonds-ds-arm64.sh
 ./scripts/test-melonds-ds-host.sh
+./scripts/test-p3-input-diagnostic.sh
 ./scripts/test-nds-frame-split.sh
 ./scripts/test-rgb565-renderer.sh
 ./gradlew --no-daemon :app:assembleDebug :app:testDebugUnitTest :app:lintDebug
@@ -83,7 +93,11 @@ export TMPDIR="$PWD/app/build/p3-tmp"
 The host integration test executes genuine pinned GPL-covered Nintendo DS
 homebrew in real melonDS, with separate top/bottom pixel checksums and input
 and audio callbacks. The firmware-free DS mode uses upstream FreeBIOS.
-The generated test ROM remains under ignored `app/build/` and is **not
+The separately built CC0 input/audio diagnostic also runs a real DS game,
+checking three precise stylus locations, release, simultaneous A+B and a
+hardware PSG sample stream. Build requires the immutable official BlocksDS
+image listed in the provenance ledger; the container is network-disabled.
+Generated test ROMs remain under ignored `app/build/` and are **not
 packaged** in the Android APK or committed to this repository. An APK build is
 not proof of Android display composition, touchscreen behavior, audio
 audibility, lifecycle, native save recovery, or sustained performance. The

@@ -1,20 +1,20 @@
 # Plump development status
 
-Last documented: 2026-11-13 (P2 mastermind accepted; P3 DS host and Android build proof, device test pending).
+Last documented: 2026-11-13 (P2 mastermind accepted; P3 on-device screens/lifecycle, host-verified interactive DS stylus+chord+PSG, phone input/audio pending).
 
 | Area | Status |
 |---|---|
 | Product scope and five discovery rounds | User decisions recorded in local source pack |
 | Home/library concept | Provisional user approval; local OpenPencil editable design |
-| GBA and DS portrait concept | GBA sketch implementation device-tested in P2; DS technical dual-screen layout implemented locally, not device-tested |
+| GBA and DS portrait concept | GBA sketch implementation device-tested in P2; DS dual-screen portrait layout, controls flanking lower panel, and enlargement visually verified on phone with one licensed test ROM |
 | Emulator core selections | P1 mGBA Libretro accepted; P3 uses pinned melonDS DS Libretro software renderer as a testable candidate, not a final architecture decision |
-| Android build/APK | Real ARM64 debug APK `0.1.3-p2-sram-verify` installed and running on iQOO Neo 6 (Android 14), preserving app data |
-| Real game execution | Owner visually verified `hello.gba` renders actual “Hello world!” on iQOO Neo 6; `sram.gba` displayed “All tests passed” |
-| Actual phone performance | Not measured |
+| Android build/APK | ARM64 `0.2.0-p3-ds-spike` (code 5) installed on iQOO Neo 6 (Android 14), with all eight existing P2 save/recovery files byte-identical after upgrade; accepted P2 code retained |
+| Real game execution | Owner verified real `hello.gba` and `sram.gba` in P2; in P3, genuine GPL NDS memory-test game displayed real results with both independent screens and expected START shutdown. New interactive CC0 DS program host-verified, phone test pending |
+| Actual phone performance | P3 owner screenshot reports 1,443 posted of 1,443 DS frames, zero rejected, 8-ms average/17-ms maximum core time for a short test interval. Sustained performance/thermal pacing unmeasured |
 | Save and recovery integrity | Real `sram.gba` on iQOO wrote two valid 32-KiB SRAM generations with expected ROM writes; both independently read and checksummed. Plump force-stop/cold launch verified full 32,768-byte core restore of generation 2. A separate disposable diagnostic ROM recovered generation 4 after the newer generation 5 checksum was corrupted. Both test generations restored from backup afterward |
 | Offline operation | Manifest declares no Internet permission and excludes platform backups; runtime offline behavior still unverified |
 | GitHub remote | Existing public Suraj-H675/Plump; accepted P2 batch pushed at `d1cef15`; P3 local only |
-| Local development | Pin-checked mGBA ARM64 `.so`, Android host build; owner confirmed real Android GBA display, all mapped control responses including A+B, audible test tone on A, pause/resume, Home/Recent Apps return, cartridge SRAM cold-load. Local licensed-header ARM keypad/PSG test ROM and host assertions pass |
+| Local development | P2 GBA device tests accepted; pinned melonDS DS ARM64 and host core built. CC0 BlocksDS DS diagnostic runs real ARM9/ARM7 homebrew with precise 3-point stylus response, release, simultaneous A+B+touch and PSG sample audio in host melonDS; new ROM copied to isolated P3 device folder with matching checksum; no further APK update |
 
 The owner authorized initial installation of APK SHA-256
 `93b3fa9e4fbe2dd398f388c0bc72c9b2f96e652d8460a6217ee73825c72da612`

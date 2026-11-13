@@ -96,3 +96,36 @@ license has been authorized. Any subsequent distribution would require a
 separate license/compliance and source-availability review, including upstream
 notices, dependency licenses and GPL obligations. The personal offline
 engineering build is not a release.
+
+## Interactive P3 homebrew: stylus, A+B chord and PSG (CC0)
+
+- Public upstream: [BlocksDS SDK](https://github.com/blocksds/sdk) Git revision
+  `5153fe216a218d676efdd6baed842ef6899fcfb5`. The examples
+  `examples/input/touch_input/source/main.c` and
+  `examples/audio/play_sounds/source/main.c` are **CC0-1.0**,
+  respectively by Adrian "asie" Siekierka and Antonio Niño Díaz (2024).
+- Plump's adapted diagnostic source is tracked and clearly attributed in
+  `tests/roms/p3-input-diagnostic/source/main.c`. The Makefile follows the
+  upstream CC0 ARM9-only makefile. It draws the actual emulated stylus at
+  native 256×192 coordinates, shows button/chord states on the other screen,
+  and produces ARM7 hardware PSG audio while A is held.
+- Built only with the official BlocksDS Linux image
+  `skylyrac/blocksds@sha256:c5f19b95d9c2f312e6a68ea244d2ed5120203b4b82af9785937a349096f8e5e4`
+  (immutable manifest). `scripts/build-p3-input-diagnostic-rom.sh` requires
+  the image be present and runs it with `--network none`, a read-only image
+  root, no privileged access, and only an ignored local build-directory mount.
+- Generated cartridge lives solely under ignored
+  `app/build/p3-input-diagnostic/p3_input_diagnostic.nds`, SHA-256
+  `109b7c302ade948e73b8b52081c37a380d8f1ea6a4c1be2cee062e1cd304482d`.
+  Neither proprietary assets nor any game binary are committed or bundled in
+  the APK.
+- Host integration proof: `scripts/test-p3-input-diagnostic.sh` runs the
+  actual ROM through pinned melonDS software emulation. Three distinct touch
+  points map to exactly the requested pixels, and the pointer marker clears
+  on release. A+B while stylus is held changes the real upper-console output,
+  and A produces nonzero PSG samples, diminishing after release. This is
+  **not a real-phone input/audio pass**.
+- The new ROM was copied only to the previously isolated
+  `/sdcard/Plump-P3-Test/p3_input_diagnostic.nds` and independently checked
+  by on-device SHA-256. No APK upgrade, original GPL fixture modification,
+  device configuration change, or access to personal ROMs was involved.

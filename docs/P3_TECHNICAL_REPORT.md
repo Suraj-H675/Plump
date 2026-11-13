@@ -1,7 +1,8 @@
 # P3 — Nintendo DS software-rendering technical checkpoint
 
 **Date:** 2026-11-13. **Status:** partially implemented, host-tested, Android
-APK built, **not device-verified or P3-accepted**. Scope ends at Nintendo DS;
+APK installed with bounded real-device display and lifecycle proof;
+**P3 is not accepted**. Scope ends at Nintendo DS;
 no DSi or 3DS game was enabled, and no owner's personal content was accessed.
 
 ## Authority and environment
@@ -92,21 +93,76 @@ response. The approximately 0.13 seconds for 100 frames is a desktop-host
 execution figure, **not a phone performance estimate**. There is no claim of
 full-speed game compatibility or sustained battery/thermal performance.
 
+### Initial physical-device DS proof (owner observed)
+
+After separately scoped approval, Plump APK version 5 (`0.2.0-p3-ds-spike`)
+was installed on the iQOO Neo 6 using `adb install -r`. All eight existing P2
+app-private cartridge-save and recovery files were first backed up to a
+private ignored local directory, and their SHA-256 hashes matched before and
+after installation. No uninstall or package-data clearing was performed.
+
+The owner supplied a screenshot showing actual homebrew memory-test output
+on the lower DS panel and an all-white upper panel (normal for this test),
+plus side controls. The on-screen emulator diagnostic reported:
+
+```text
+DS frames=1443 posted=1443 rejected=0 avgCore=8ms peakCore=17ms
+```
+
+The owner confirmed that lower-screen enlargement worked, and that Pause/
+Resume and Android Home/Recents return preserved the test. Pressing virtual
+START made both panels black. A reproducible host experiment with the same
+ROM and START input logged `Stopping emulated console (Reason: PowerOff)`;
+Plump's Android app process remained alive, consistent with normal test-ROM
+exit rather than a crash. These observations prove the initial physical
+dual-screen slice and tested lifecycle, **not** sustained performance, audio,
+accurate touchscreen/drag or DS native cartridge saves.
+
+### Interactive DS input/audio fixture: genuine host execution
+
+A small, reproducible **CC0-licensed ARM9+ARM7 NDS program** was derived from
+the official BlocksDS touch and PSG examples. Its source is tracked at
+`tests/roms/p3-input-diagnostic/`, and its immutable, network-disabled
+BlocksDS build is `scripts/build-p3-input-diagnostic-rom.sh`. The generated
+cartridge remains only under ignored `app/build/`, not in the APK or Git.
+
+`tests/roms/verify-p3-input-diagnostic.py` exercised the true pinned Linux
+melonDS DS engine using the same signed Libretro pointer encoding as the
+Android JNI adapter. Synthetic taps at (32,32), (128,96), and (224,160)
+produced respectively the bounding boxes (28,28)-(36,36),
+(124,92)-(132,100), and (220,156)-(228,164), with 65 nonblack marker
+pixels each. Releasing the stylus left no marker. Holding A+B while touching
+the center left the marker correctly positioned and changed the upper DS
+console's button display checksum. Real PSG PCM output peaked at 19,945
+while A was held and fell to 27 in the release interval. Earlier startup/
+idle sound was nonzero; the report does **not** claim it was silent.
+
+An initial disposable **host test harness** accidentally offset signed
+pointer values by 32,768; it was corrected before creating the committed
+regression test. This was not a defect in the P3 JNI native converter.
+These are real core host results, not yet physical touchscreen/audio proof.
+
+Diagnostic ROM SHA-256:
+`109b7c302ade948e73b8b52081c37a380d8f1ea6a4c1be2cee062e1cd304482d`.
+It was transferred to the existing isolated
+`/sdcard/Plump-P3-Test/p3_input_diagnostic.nds`, and its on-device hash was
+verified. No new APK was built or installed. Phone interaction remains next.
+
 ## Android candidate and verification level
 
 | Scope | Evidence | Verdict |
 |---|---|---|
-| DS-01 real execution and 2 screens | Host ran 100 frames; two distinct 256×192 panels extracted; Android binary compiled | **Host verified; phone pending** |
-| DS-02 portrait layout | Separate upper/lower SurfaceViews, upper wider, lower centered between side buttons in default; correct native ratios | **Implemented, phone UX unverified** |
-| DS-03 touchscreen tap/drag | Pointer-ID tracking; local inverse coordinates mapped to combined Libretro bottom viewport; geometry JVM tests | **Implementation and arithmetic tested, game response unverified** |
-| DS-04 concurrent touch and buttons | Separate touch and button views plus independent atomic state; all 12 DS button hit regions and simultaneous masks in JVM tests | **Implementation/test only; real multitouch unverified** |
-| DS-05 lower enlargement | Toggle to full-width lower with side controls moved below; releases old pointer states and reuses touch mapper | **Implemented, on-device transform unverified** |
+| DS-01 real execution and 2 screens | Host ran 100 frames; both 256×192 panels extracted; owner screenshot shows genuine DS test text and both physical screens with 1,443 presented frames | **Initial fixture device pass; broader games pending** |
+| DS-02 portrait layout | Upper larger, smaller lower centered between controls in owner screenshot | **Default physical layout observed** |
+| DS-03 touchscreen tap/drag | Host-marker test verifies three exact DS coordinates and release; Android native mapper shares same formula | **Host verified; phone touch response pending** |
+| DS-04 concurrent touch and buttons | Host game changed live A+B state during stylus without losing marker; JVM simultaneous input tests | **Host verified; physical simultaneous input pending** |
+| DS-05 lower enlargement | Owner confirmed lower grows with toggle; native touch transform invariants tested on host | **Physical enlargement pass; enlarged-mode touch accuracy pending** |
 | DS-06 layouts/insets | 4 lower display widths exercised in JVM tests; Android `fitsSystemWindows` set | **3 real layouts, safe areas and accessibility pending** |
 | DS-07 native save persistence | Existing checksummed two-generation `GameSaveStore` reused for separate `nds-native-saves` and SHA-256 game ID; restore readback before frames | **Store tests pass; no DS cartridge SRAM cold test** |
 | DS-08 save states | No DS save-state UI or serializing JNI exposed; no false save-state claims | **Not implemented; future P3 decision** |
 | DS-09 DSi | Forced DS mode; no licensed DSi BIOS/firmware/NAND | **Not implemented; explicit gaps below** |
-| Audio and lifecycle | Separate AudioTrack emulation path, pause/back/foreground join+flush; host audio callbacks | **Compiles; real-device audible/interrupt proof pending** |
-| Performance | Native frame posted/rejected counters and `avgCore`/`peakCore` timing in Android log | **Instrumentation only; zero Android measurements** |
+| Audio and lifecycle | Owner verified Pause/Resume and Home/Recents; genuine PSG samples in new host ROM | **Device lifecycle pass for memory fixture; audible DS PSG pending** |
+| Performance | Actual device screen showed 1,443/1,443 posted, zero rejected, average/peak 8/17 ms core time | **Short interval observed; sustained pacing unverified** |
 | GBA regression | mGBA native core and `native-saves` directory unchanged; host GBA pixel test, existing save/button JVM tests and APK build pass | **Source/build regression check only; device retest pending** |
 
 **Test counts:** 16 JVM tests pass (7 native-save integrity, 3 GBA pointer
@@ -146,9 +202,10 @@ claimed. Upstream DSiWare metadata-fetch behavior also conflicts with
 Plump's entirely offline guarantee and would need to be disabled or replaced
 before DSi enablement. DSi mode remains deliberately inaccessible.
 
-## Proposed controlled device experiment — **requires new authorization**
+## First controlled device experiment — **approved and executed**
 
-The P3 Android debug candidate is **not yet installed**. Intended identity:
+The P3 Android debug candidate **was installed** after exact identity and
+app-private backup verification. Installed identity:
 
 - Package `dev.plump.emulator` (same as accepted P2); `versionCode=5`,
   `versionName=0.2.0-p3-ds-spike`; ARM64 only; min API 26, target API 35;
@@ -157,44 +214,39 @@ The P3 Android debug candidate is **not yet installed**. Intended identity:
   `app/build/outputs/apk/debug/app-debug.apk`.
   Current final build SHA-256:
   `55d1d8b8fb344213836ed797d7f669917c242ad5e18554849a7b8808f9f89489`.
-  Reverify this exact hash immediately before any authorized install; abort if
-  it differs.
-- Current accepted installed version is P2 `0.1.3-p2-sram-verify` (code 4)
-  according to the P2 device report. Recheck package/device identity and
-  installed version **read-only** before any operation; abort on mismatch.
+  This hash was checked against the installed approved APK; reverify before
+  any future separately authorized install and abort if it differs.
+- Pre-update installed version was P2 `0.1.3-p2-sram-verify` (code 4).
+  Installed version after the scoped update is code 5. The P2 test-save
+  backup and post-install hashes matched for all eight existing files.
 
-**Preserve P2 test data first:** with new, specific approval, keep Plump
-closed, inspect only `dev.plump.emulator`'s own app-private
-`files/native-saves/`, take a byte-for-byte copy to a private, local,
-non-Git backup outside the phone using `run-as`, verify its hashes, and abort
-the update if the backup fails. Back up any existing Plump diagnostic save
-data without accessing ROMs, unrelated files or apps. Install only the exact
-approved APK using `adb install -r` (no uninstall, `pm clear`, overwrite of
-saves, system changes or app data migration). Recheck the unchanged GBA files
-and run P2 hello, input/audio and SRAM cold-readback regression tests before
-counting DS tests as success. Restore only with a separate recovery decision;
-never automatically rewrite device saves.
+**Preserve P2 test data first:** with the explicit authorization, Plump was
+closed; inspection was restricted to `dev.plump.emulator`'s own app-private
+`files/native-saves/` and the disposable recovery backup. A byte-for-byte
+copy was made privately using `run-as` with host/device SHA-256 agreement.
+Only the approved APK was installed using `adb install -r` without uninstall,
+`pm clear`, overwrite of saves, system settings changes or app data migration.
+Previous GBA ROM checksums were preserved. Full physical GBA re-execution
+remains a separate regression gate. Never automatically rewrite device saves.
 
-**Licensed P3 fixture scope:** if approved, copy only the pinned GPL-covered
-upstream `.nds` test to a new isolated `/sdcard/Plump-P3-Test/` folder, verify
-its SHA-256 on the phone and select it using Plump's document picker. Observe
-two independently displayed game screens, native ratios, lower enlargement
-and pointer alignment; log real `frames`, `posted`, `rejected` and core-time
-measurements, audio device behavior, pause/return, and touchscreen pointer
-release. To complete the strict stylus/button/game-response and cartridge
-save gates, acquire or construct **additional appropriately licensed test
-content** before claiming those checks passed; this homebrew fixture is not
-sufficient. No automated phone taps, no private ROM/firmware access, no
-proprietary system file acquisition. Any further APK update after the first
-device experiment needs fresh approval.
+**Licensed P3 fixture scope:** The approved experiment copied the pinned GPL-covered
+upstream `.nds` test to a new isolated `/sdcard/Plump-P3-Test/` folder, verified
+its SHA-256 on the phone and selected it using Plump's document picker.
+The owner inspected both real displays, lower enlargement, controls, pause and
+return. The subsequent CC0 input/audio fixture is a distinct, deliberately
+licensed test program to cover the remaining physical stylus and chord gap;
+it is available in the same isolated P3 folder. The current homebrew content
+does **not** exercise native cartridge SRAM cold persistence. There were no
+automated phone taps, private ROM/firmware reads or proprietary-file downloads.
+Any new APK update after this first device experiment requires separate approval.
 
 ## Milestone recommendation to mastermind
 
 Keep P3 **open**. The software Libretro route now has credible pinned Android
 build and genuine host execution evidence, which avoids the complexity of
 direct native melonDS for the moment. Review the bounded P3 source and the
-device test plan. Permit a tightly scoped Plump-only, data-preserving APK
-update only when the owner explicitly approves. Use subsequent real-device
-evidence and an interactive licensed fixture to decide whether the Libretro
+device test plan. The first data-preserving APK update was approved and
+performed. Use the now-prepared interactive CC0 fixture with real-device
+evidence to decide whether the Libretro
 software route meets DS-01..08, particularly touchscreen, audio, saves and
 long-duration performance. Do **not** start 3DS or unrelated UI polishing.
