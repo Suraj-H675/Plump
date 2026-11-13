@@ -1,19 +1,19 @@
 # Plump development status
 
-Last documented: 2026-11-13 (P2 GBA device-test suite executed; awaiting mastermind milestone acceptance).
+Last documented: 2026-11-13 (P2 mastermind accepted; P3 DS host and Android build proof, device test pending).
 
 | Area | Status |
 |---|---|
 | Product scope and five discovery rounds | User decisions recorded in local source pack |
 | Home/library concept | Provisional user approval; local OpenPencil editable design |
-| GBA and DS portrait concept | User-supplied sketch reference; implementation untested |
-| Emulator core selections | P1 accepted mGBA Libretro for GBA spike, pinned SHA in upstream ledger; DS/3DS architecture not locked |
+| GBA and DS portrait concept | GBA sketch implementation device-tested in P2; DS technical dual-screen layout implemented locally, not device-tested |
+| Emulator core selections | P1 mGBA Libretro accepted; P3 uses pinned melonDS DS Libretro software renderer as a testable candidate, not a final architecture decision |
 | Android build/APK | Real ARM64 debug APK `0.1.3-p2-sram-verify` installed and running on iQOO Neo 6 (Android 14), preserving app data |
 | Real game execution | Owner visually verified `hello.gba` renders actual “Hello world!” on iQOO Neo 6; `sram.gba` displayed “All tests passed” |
 | Actual phone performance | Not measured |
 | Save and recovery integrity | Real `sram.gba` on iQOO wrote two valid 32-KiB SRAM generations with expected ROM writes; both independently read and checksummed. Plump force-stop/cold launch verified full 32,768-byte core restore of generation 2. A separate disposable diagnostic ROM recovered generation 4 after the newer generation 5 checksum was corrupted. Both test generations restored from backup afterward |
 | Offline operation | Manifest declares no Internet permission and excludes platform backups; runtime offline behavior still unverified |
-| GitHub remote | Existing Suraj-H675/Plump, currently public |
+| GitHub remote | Existing public Suraj-H675/Plump; accepted P2 batch pushed at `d1cef15`; P3 local only |
 | Local development | Pin-checked mGBA ARM64 `.so`, Android host build; owner confirmed real Android GBA display, all mapped control responses including A+B, audible test tone on A, pause/resume, Home/Recent Apps return, cartridge SRAM cold-load. Local licensed-header ARM keypad/PSG test ROM and host assertions pass |
 
 The owner authorized initial installation of APK SHA-256
@@ -58,8 +58,30 @@ pre-test generations were restored byte-for-byte after stopping Plump; another
 game's SRAM files retained their original SHA-256 hashes. Full evidence and
 remaining limitations are in [P2_DEVICE_TEST_REPORT.md](P2_DEVICE_TEST_REPORT.md).
 
-**P2 bounded acceptance evidence is ready for mastermind review.** Extended
+**The mastermind accepted P2 at `d1cef15b73c490eb2aa3e7a2c66a2e25ed8004a4`.** Extended
 performance and audio synchronization measurement, power-loss/dual-corrupt-save
 testing, and many future product guarantees remain unverified. The P2 APK is a
 diagnostic vertical slice, not a product release or replacement for the owner's
-provisional OpenPencil UI. DS/3DS implementation is out of this checkpoint.
+provisional OpenPencil UI.
+
+## P3 technical slice — local source and host verification only
+
+The pinned melonDS DS Libretro source (revision `f394adba`) and pinned native
+dependencies compile to a real Android ARM64 software core. A second native
+build executed its GPL-covered `tests_sys_mem_regions.nds` homebrew on the host
+for 100 real frames. Both native 256×192 display regions contained pixel data;
+only the lower screen changed in that particular test. The Libretro callback
+reported 54,705 audio sample frames and 100 input polls. These are **host**
+results, not phone or audible-audio proof. `DsActivity`, `NativeDs`, JNI
+surface split, touchscreen mapper, D-pad and A/B/X/Y/L/R/Start/Select side
+controls, lower enlargement, audio and native SRAM persistence plumbing are
+implemented. P2 GBA code and GBA save directory were kept intact.
+
+The local version 5 (`0.2.0-p3-ds-spike`) debug APK compiles and passed lint,
+16 JVM tests and native pixel assertions. **It has not been installed, touched
+or tested on the owner's phone.** P3 DS-01..08 still need real device tests,
+especially simultaneous stylus/button behavior, SD-card save protection,
+native DS cartridge cold-save persistence and sustained performance. DSi mode
+is disabled and requires separately lawful firmware/NAND and its own save
+integrity process; DSi savestates and camera are unavailable in this core.
+See [P3 technical report](P3_TECHNICAL_REPORT.md) and the source ledger.

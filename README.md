@@ -15,8 +15,9 @@ dual-screen layout for DS/3DS-family systems.
   checkpoints, independent per-game resume, and optional local-folder backups.
 - No online account, cloud services, telemetry, or multiplayer.
 
-**Status (2026-11-13):** P1 technical feasibility was accepted. The bounded
-P2 ARM64 Android app is **running real mGBA test ROMs on the owner's iQOO Neo 6**.
+**Status (2026-11-13):** P1 and the bounded P2 GBA device milestone were
+**accepted by the mastermind**. The P2 ARM64 Android app is **running real mGBA
+test ROMs on the owner's iQOO Neo 6**.
 The owner visually verified `hello.gba` rendering and `sram.gba` execution,
 plus basic pause/resume and Android backgrounding. The 32-KiB native cartridge
 save survived a Plump force-stop and cold restart: the core verified it
@@ -27,7 +28,12 @@ newer disposable generation's checksum was deliberately damaged. See
 [P2 device-test report](docs/P2_DEVICE_TEST_REPORT.md). **Long-running audio
 synchronization, performance, broad game compatibility, crash-hardening and
 product-quality UX are not yet verified.** This is not product-ready and P2
-mastermind acceptance remains pending; DS/3DS integrations remain unselected.
+The accepted P2 HEAD `d1cef15` was pushed to the existing public source
+repository; no APK was released. **P3 DS work is a local unaccepted technical
+slice**: a pinned melonDS DS software core built for Android ARM64, and the
+same core executed an upstream-licensed DS homebrew test on the development
+computer. An Android dual-screen candidate compiles, but is **not installed or
+verified on the phone**. See [P3 technical report](docs/P3_TECHNICAL_REPORT.md).
 
 ## P2 development build (Android ARM64 only)
 
@@ -48,14 +54,40 @@ This generates `app/build/outputs/apk/debug/app-debug.apk`; upstream native
 source and compiled libraries are excluded from Git. The APK contains no game
 ROMs and requests no network or storage-wide Android permissions. Select an
 appropriately licensed local test ROM through Android's document picker.
-The owner's approved P2 device test permits Plump-only APK updates with app
-data preserved, and isolated licensed/original test ROMs. Device operations
-outside that test scope still require authorization.
+Prior P2 testing does **not** authorize installing a P3 APK. Any further
+device operation requires new, separately scoped user authorization.
 The input/audio test ROM is generated only in ignored `app/build/` using the
 pinned NDK assembler and a checksum-verified MIT-licensed GBA cartridge header;
 the ROM is never bundled into the APK or checked into Git.
 See `docs/UPSTREAM_SOURCES.md` for exact upstream revision and test-fixture
 provenance, and `docs/STATUS.md` for acceptance limitations.
+
+## P3 DS software-rendering experiment (Android ARM64)
+
+Use the existing, pinned melonDS DS checkout described in
+`docs/UPSTREAM_SOURCES.md`. Configure Android SDK/NDK as above. Due to an
+unrelated `/tmp` user-quota limit on the development machine, scratch files
+are owned by ignored `app/build/p3-tmp` instead of `/tmp`:
+
+```sh
+export ANDROID_HOME="$HOME/Android/Sdk"
+export ANDROID_SDK_ROOT="$ANDROID_HOME"
+export TMPDIR="$PWD/app/build/p3-tmp"
+./scripts/build-melonds-ds-arm64.sh
+./scripts/test-melonds-ds-host.sh
+./scripts/test-nds-frame-split.sh
+./scripts/test-rgb565-renderer.sh
+./gradlew --no-daemon :app:assembleDebug :app:testDebugUnitTest :app:lintDebug
+```
+
+The host integration test executes genuine pinned GPL-covered Nintendo DS
+homebrew in real melonDS, with separate top/bottom pixel checksums and input
+and audio callbacks. The firmware-free DS mode uses upstream FreeBIOS.
+The generated test ROM remains under ignored `app/build/` and is **not
+packaged** in the Android APK or committed to this repository. An APK build is
+not proof of Android display composition, touchscreen behavior, audio
+audibility, lifecycle, native save recovery, or sustained performance. The
+P3 APK will not be installed without explicit permission.
 
 ## Planning and execution
 

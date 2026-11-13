@@ -1,0 +1,473 @@
+package dev.plump.emulator;
+
+import android.app.Activity;
+import android.content.Intent;
+import android.graphics.Color;
+import android.media.AudioAttributes;
+import android.media.AudioFormat;
+import android.media.AudioManager;
+import android.media.AudioTrack;
+import android.net.Uri;
+import android.os.Bundle;
+import android.os.SystemClock;
+import android.system.Os;
+import android.view.Gravity;
+import android.view.MotionEvent;
+import android.view.SurfaceHolder;
+import android.view.SurfaceView;
+import android.view.View;
+import android.widget.Button;
+import android.widget.LinearLayout;
+import android.widget.TextView;
+
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileDescriptor;
+import java.io.IOException;
+import java.io.InputStream;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.Arrays;
+import java.util.Locale;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.LockSupport;
+
+/** P3 technical slice: two real DS screens; isolated from the accepted GBA host. */
+public final class DsActivity extends Activity {
+    private static final int REQUEST_ROM = 63;
+    private static final int MAX_ROM = 64 * 1024 * 1024;
+    private final AtomicBoolean running = new AtomicBoolean();
+    private Thread emulatorThread, audioThread;
+    private DsControlsView left, right;
+    private TouchPanel bottom;
+    private LinearLayout screenRow, extraControls;
+    private Button pauseButton, expandButton;
+    private TextView status;
+    private GameSaveStore saveStore;
+    private String gameId;
+    private long frames, lastStats;
+    private boolean coreReady, loaded, userPaused, foreground, enlarged;
+
+    private int dp(float value) { return (int) (getResources().getDisplayMetrics().density * value + .5f); }
+    private void message(String message) { status.setText(message); }
+    private void error(String message) { runOnUiThread(() -> message(message)); }
+
+    private final class TouchPanel extends SurfaceView {
+        private int pointerId = -1;
+        TouchPanel() {
+            super(DsActivity.this);
+            setContentDescription("Nintendo DS lower touchscreen, tap or drag directly");
+            // SurfaceView must not have an opaque background (P2 device rendering defect).
+        }
+
+        @Override protected void onMeasure(int w, int h) {
+            int width = MeasureSpec.getSize(w);
+            setMeasuredDimension(width, width * 192 / 256);
+        }
+
+        void release() {
+            pointerId = -1;
+            if (coreReady) NativeDs.touch(false, 0, 0);
+        }
+
+        @Override public boolean onTouchEvent(MotionEvent event) {
+            int action = event.getActionMasked();
+            if (action == MotionEvent.ACTION_CANCEL) { release(); return true; }
+            if (action == MotionEvent.ACTION_DOWN) pointerId = event.getPointerId(event.getActionIndex());
+            if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_POINTER_UP) {
+                if (pointerId == event.getPointerId(event.getActionIndex())) {
+                    release();
+                    performClick();
+                    return true;
+                }
+            }
+            int index = event.findPointerIndex(pointerId);
+            if (index < 0) return true;
+            float x = event.getX(index), y = event.getY(index);
+            boolean inside = DsTouchMapper.inside(x, y, getWidth(), getHeight());
+            if (coreReady) NativeDs.touch(inside,
+                    DsTouchMapper.x(x, getWidth()), DsTouchMapper.y(y, getHeight()));
+            return true;
+        }
+        @Override public boolean performClick() { super.performClick(); return true; }
+    }
+
+    @Override public void onCreate(Bundle state) {
+        super.onCreate(state);
+        setRequestedOrientation(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT);
+        getWindow().setStatusBarColor(Color.BLACK);
+        getWindow().setNavigationBarColor(Color.BLACK);
+
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setBackgroundColor(Color.rgb(16, 19, 23));
+        root.setFitsSystemWindows(true);
+        root.setMotionEventSplittingEnabled(true);
+        LinearLayout toolbar = new LinearLayout(this);
+        toolbar.setGravity(Gravity.CENTER_VERTICAL);
+        status = new TextView(this);
+        status.setTextColor(Color.WHITE);
+        status.setTextSize(12);
+        status.setText("DS — choose a local .nds test ROM");
+        status.setPadding(dp(8), 0, dp(4), 0);
+        toolbar.addView(status, new LinearLayout.LayoutParams(0, dp(56), 1));
+        Button open = new Button(this);
+        open.setText("Open");
+        open.setOnClickListener(v -> openRom());
+        toolbar.addView(open, new LinearLayout.LayoutParams(dp(78), dp(56)));
+        pauseButton = new Button(this);
+        pauseButton.setText("Pause");
+        pauseButton.setOnClickListener(v -> togglePause());
+        toolbar.addView(pauseButton, new LinearLayout.LayoutParams(dp(79), dp(56)));
+        root.addView(toolbar);
+
+        SurfaceView top = new SurfaceView(this) {
+            @Override protected void onMeasure(int w, int h) {
+                int width = MeasureSpec.getSize(w);
+                setMeasuredDimension(width, width * 192 / 256);
+            }
+        };
+        top.setContentDescription("Nintendo DS upper 256 by 192 display");
+        root.addView(top, new LinearLayout.LayoutParams(-1, -2));
+        top.getHolder().addCallback(new SurfaceHolder.Callback() {
+            @Override public void surfaceCreated(SurfaceHolder holder) { if (coreReady) NativeDs.topSurface(holder.getSurface()); }
+            @Override public void surfaceChanged(SurfaceHolder holder, int format, int w, int h) {
+                if (coreReady) NativeDs.topSurface(holder.getSurface());
+            }
+            @Override public void surfaceDestroyed(SurfaceHolder holder) { if (coreReady) NativeDs.topSurface(null); }
+        });
+
+        expandButton = new Button(this);
+        expandButton.setText("Enlarge lower screen");
+        expandButton.setOnClickListener(v -> changeLowerSize());
+        root.addView(expandButton, new LinearLayout.LayoutParams(-1, dp(43)));
+
+        screenRow = new LinearLayout(this);
+        screenRow.setOrientation(LinearLayout.HORIZONTAL);
+        screenRow.setMotionEventSplittingEnabled(true);
+        bottom = new TouchPanel();
+        left = new DsControlsView(this, true, this::sendButtons);
+        right = new DsControlsView(this, false, this::sendButtons);
+        screenRow.addView(left);
+        screenRow.addView(bottom);
+        screenRow.addView(right);
+        root.addView(screenRow);
+        extraControls = new LinearLayout(this);
+        extraControls.setOrientation(LinearLayout.HORIZONTAL);
+        extraControls.setMotionEventSplittingEnabled(true);
+        root.addView(extraControls);
+        setContentView(root);
+
+        root.post(() -> updateLowerLayout(root.getWidth()));
+        bottom.getHolder().addCallback(new SurfaceHolder.Callback() {
+            @Override public void surfaceCreated(SurfaceHolder holder) { if (coreReady) NativeDs.bottomSurface(holder.getSurface()); }
+            @Override public void surfaceChanged(SurfaceHolder holder, int format, int w, int h) {
+                if (coreReady) NativeDs.bottomSurface(holder.getSurface());
+            }
+            @Override public void surfaceDestroyed(SurfaceHolder holder) {
+                bottom.release();
+                if (coreReady) NativeDs.bottomSurface(null);
+            }
+        });
+
+        if (NativeDs.LOAD_ERROR != null) {
+            message("DS core library unavailable: " + NativeDs.LOAD_ERROR);
+            return;
+        }
+        try {
+            File sys = new File(getFilesDir(), "nds-system");
+            File coreSaves = new File(getFilesDir(), "nds-core-data");
+            if ((!sys.isDirectory() && !sys.mkdirs()) ||
+                (!coreSaves.isDirectory() && !coreSaves.mkdirs()))
+                throw new IOException("Cannot create private core directories");
+            saveStore = new GameSaveStore(new File(getFilesDir(), "nds-native-saves"), directory -> {
+                FileDescriptor fd = null;
+                try {
+                    fd = Os.open(directory.getAbsolutePath(), android.system.OsConstants.O_RDONLY, 0);
+                    Os.fsync(fd);
+                } catch (android.system.ErrnoException failure) {
+                    throw new IOException("Directory durability sync failed", failure);
+                } finally {
+                    // Os.open's FileDescriptor is closed using the same API that opened it.
+                    if (fd != null) try { Os.close(fd); } catch (android.system.ErrnoException ignored) { }
+                }
+            });
+            String issue = NativeDs.initialize(sys.getAbsolutePath(), coreSaves.getAbsolutePath());
+            if (issue != null) { message("Cannot initialize melonDS: " + issue); return; }
+            coreReady = true;
+            if (top.getHolder().getSurface().isValid()) NativeDs.topSurface(top.getHolder().getSurface());
+            if (bottom.getHolder().getSurface().isValid()) NativeDs.bottomSurface(bottom.getHolder().getSurface());
+        } catch (IOException failure) {
+            message("DS private storage unavailable: " + failure.getMessage());
+        }
+    }
+
+    private void updateLowerLayout(int width) {
+        if (width <= 0) return;
+        bottom.release();
+        left.releaseAll();
+        right.releaseAll();
+        if (enlarged) {
+            if (left.getParent() == screenRow) screenRow.removeView(left);
+            if (right.getParent() == screenRow) screenRow.removeView(right);
+            if (left.getParent() != extraControls) {
+                extraControls.addView(left, new LinearLayout.LayoutParams(0, dp(130), 1f));
+                extraControls.addView(right, new LinearLayout.LayoutParams(0, dp(130), 1f));
+            }
+            bottom.setLayoutParams(new LinearLayout.LayoutParams(width, width * 3 / 4));
+        } else {
+            if (left.getParent() == extraControls) extraControls.removeView(left);
+            if (right.getParent() == extraControls) extraControls.removeView(right);
+            if (left.getParent() != screenRow) {
+                screenRow.addView(left, 0);
+                screenRow.addView(right);
+            }
+            int lowerWidth = (int) (width * .62f);
+            int height = lowerWidth * 3 / 4;
+            left.setLayoutParams(new LinearLayout.LayoutParams((width - lowerWidth) / 2, height));
+            bottom.setLayoutParams(new LinearLayout.LayoutParams(lowerWidth, height));
+            right.setLayoutParams(new LinearLayout.LayoutParams(width - lowerWidth - (width - lowerWidth) / 2, height));
+        }
+        sendButtons();
+    }
+
+    private void changeLowerSize() {
+        enlarged = !enlarged;
+        expandButton.setText(enlarged ? "Restore lower screen" : "Enlarge lower screen");
+        updateLowerLayout(screenRow.getWidth());
+    }
+
+    private void sendButtons() {
+        if (coreReady && left != null && right != null) NativeDs.buttons(left.mask() | right.mask());
+    }
+
+    private void openRom() {
+        if (!coreReady) { message("DS core is not initialized"); return; }
+        Intent picker = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        picker.addCategory(Intent.CATEGORY_OPENABLE);
+        picker.setType("*/*");
+        picker.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        startActivityForResult(picker, REQUEST_ROM);
+    }
+
+    @Override protected void onActivityResult(int request, int result, Intent data) {
+        super.onActivityResult(request, result, data);
+        if (request != REQUEST_ROM || result != RESULT_OK || data == null || data.getData() == null || !coreReady) return;
+        byte[] bytes;
+        try { bytes = readRom(data.getData()); }
+        catch (IOException failure) { message("Cannot read DS file: " + failure.getMessage()); return; }
+        if (!stopAndSave()) { message("Previous DS session did not stop safely"); return; }
+        if (loaded) NativeDs.unload();
+        loaded = false;
+        gameId = null;
+        frames = 0;
+        String issue = NativeDs.load(bytes);
+        if (issue != null) { message("DS ROM rejected: " + issue); return; }
+        String identity = identity(bytes);
+        GameSaveStore.Recovery prior = saveStore.load(identity);
+        if (prior.warning != null && prior.bytes == null) {
+            NativeDs.unload();
+            message("Corrupt DS save preserved; refusing to start the cartridge");
+            return;
+        }
+        if (prior.bytes != null) {
+            String restoreError = NativeDs.restore(prior.bytes);
+            byte[] checked = restoreError == null ? NativeDs.snapshot() : null;
+            if (restoreError != null || checked == null || !Arrays.equals(prior.bytes, checked)) {
+                NativeDs.unload();
+                message("DS save preserved; core restore validation failed");
+                return;
+            }
+            android.util.Log.i("PlumpDS", "DS cartridge save restored and byte-verified: generation=" + prior.generation);
+        }
+        loaded = true;
+        gameId = identity;
+        userPaused = false;
+        pauseButton.setText("Pause");
+        message(prior.warning != null ? prior.warning :
+                (NativeDs.saveSize() == 0 ? "DS loaded — homebrew SD storage is experimental; not backed up" :
+                        NativeDs.saveSize() > 1024 * 1024 ?
+                        "DS loaded — unsupported cartridge-save size; do not rely on saving" :
+                        "DS loaded — native cartridge save active"));
+        if (foreground) start();
+    }
+
+    private byte[] readRom(Uri file) throws IOException {
+        try (InputStream stream = getContentResolver().openInputStream(file)) {
+            if (stream == null) throw new IOException("No document stream");
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            byte[] buffer = new byte[16384];
+            int length;
+            while ((length = stream.read(buffer)) != -1) {
+                if (output.size() > MAX_ROM - length) throw new IOException("Test ROM exceeds 64 MiB");
+                output.write(buffer, 0, length);
+            }
+            if (output.size() < 512) throw new IOException("Incomplete DS cartridge");
+            return output.toByteArray();
+        }
+    }
+
+    private static String identity(byte[] bytes) {
+        try {
+            byte[] hash = MessageDigest.getInstance("SHA-256").digest(bytes);
+            StringBuilder out = new StringBuilder(64);
+            for (byte b : hash) out.append(String.format(Locale.ROOT, "%02x", b & 255));
+            return out.toString();
+        } catch (NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
+    }
+
+    private void togglePause() {
+        if (!loaded) { message("Choose an NDS test ROM first"); return; }
+        userPaused = !userPaused;
+        if (userPaused) {
+            boolean saved = stopAndSave();
+            message(saved ? "DS paused — cartridge save flushed where available" : "DS paused — save failed");
+            pauseButton.setText("Resume");
+        } else {
+            pauseButton.setText("Pause");
+            if (foreground) start();
+        }
+    }
+
+    private void start() {
+        if (!loaded || !coreReady || !foreground || userPaused || !running.compareAndSet(false, true)) return;
+        emulatorThread = new Thread(() -> {
+            long period = (long) (1_000_000_000.0 / NativeDs.rate());
+            long deadline = System.nanoTime();
+            long previousSave = SystemClock.elapsedRealtime();
+            long sumFrameNs = 0;
+            long maximumFrameNs = 0;
+            int measured = 0;
+            while (running.get()) {
+                long start = System.nanoTime();
+                NativeDs.frame();
+                long frameNs = System.nanoTime() - start;
+                sumFrameNs += frameNs;
+                maximumFrameNs = Math.max(maximumFrameNs, frameNs);
+                ++frames;
+                ++measured;
+                long now = SystemClock.elapsedRealtime();
+                if (now - lastStats > 3000) {
+                    lastStats = now;
+                    String metrics = NativeDs.stats() + " avgCore=" + (sumFrameNs / Math.max(1, measured) / 1_000_000) +
+                            "ms peakCore=" + maximumFrameNs / 1_000_000 + "ms";
+                    android.util.Log.i("PlumpDS", metrics);
+                    runOnUiThread(() -> { if (loaded && !userPaused) message("DS " + metrics); });
+                    measured = 0;
+                    sumFrameNs = maximumFrameNs = 0;
+                }
+                if (now - previousSave >= 30_000) {
+                    save(false);
+                    previousSave = now;
+                }
+                deadline += period;
+                long wait = deadline - System.nanoTime();
+                if (wait > 0) LockSupport.parkNanos(wait);
+                else if (wait < -3 * period) deadline = System.nanoTime();
+            }
+        }, "Plump-DS-core");
+        emulatorThread.start();
+        audioThread = new Thread(this::pumpAudio, "Plump-DS-audio");
+        audioThread.start();
+    }
+
+    private void pumpAudio() {
+        AudioTrack output = null;
+        try {
+            int rate = NativeDs.audioRate();
+            int min = AudioTrack.getMinBufferSize(rate, AudioFormat.CHANNEL_OUT_STEREO,
+                    AudioFormat.ENCODING_PCM_16BIT);
+            if (min <= 0) throw new IllegalStateException("Unsupported DS audio format");
+            output = new AudioTrack(new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_GAME)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build(),
+                    new AudioFormat.Builder().setSampleRate(rate).setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                            .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO).build(),
+                    Math.max(min, 16384), AudioTrack.MODE_STREAM, AudioManager.AUDIO_SESSION_ID_GENERATE);
+            if (output.getState() != AudioTrack.STATE_INITIALIZED) throw new IllegalStateException("AudioTrack unavailable");
+            output.play();
+            short[] samples = new short[2048];
+            while (running.get()) {
+                int size = NativeDs.drain(samples);
+                if (size == 0) { SystemClock.sleep(5); continue; }
+                int written = 0;
+                while (written < size && running.get()) {
+                    int result = output.write(samples, written, size - written, AudioTrack.WRITE_NON_BLOCKING);
+                    if (result < 0) throw new IllegalStateException("PCM output failed: " + result);
+                    if (result == 0) SystemClock.sleep(3);
+                    else written += result;
+                }
+            }
+        } catch (Exception failure) {
+            error("DS sound unavailable: " + failure.getMessage());
+            running.set(false);
+        } finally {
+            if (output != null) try { output.pause(); output.flush(); output.release(); }
+            catch (IllegalStateException ignored) { }
+        }
+    }
+
+    private boolean stopAndSave() {
+        running.set(false);
+        if (bottom != null && coreReady) bottom.release();
+        if (left != null) left.releaseAll();
+        if (right != null) right.releaseAll();
+        if (coreReady) NativeDs.buttons(0);
+        if (!join(emulatorThread) || !join(audioThread)) {
+            message("DS threads did not stop; save and core unload blocked");
+            return false;
+        }
+        emulatorThread = audioThread = null;
+        if (coreReady) NativeDs.clearAudio();
+        return save(true);
+    }
+
+    private boolean join(Thread thread) {
+        if (thread == null) return true;
+        thread.interrupt();
+        try { thread.join(1800); } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+        return !thread.isAlive();
+    }
+
+    private boolean save(boolean report) {
+        if (!loaded || frames == 0 || gameId == null || saveStore == null) return true;
+        try {
+            int size = NativeDs.saveSize();
+            if (size == 0) return true; // Homebrew virtual SD files are NOT cartridge SRAM.
+            if (size < 0 || size > 1024 * 1024)
+                throw new IOException("Unsupported DS SRAM size " + size + "; existing progress not flushed");
+            byte[] data = NativeDs.snapshot();
+            if (data == null || data.length != size)
+                throw new IOException("DS cartridge SRAM returned no complete snapshot");
+            saveStore.write(gameId, data);
+            return true;
+        } catch (IOException failure) {
+            if (report) message("DS cartridge SRAM NOT saved: " + failure.getMessage());
+            else error("DS periodic cartridge save failed: " + failure.getMessage());
+            return false;
+        }
+    }
+
+    @Override protected void onResume() {
+        super.onResume();
+        foreground = true;
+        if (loaded && !userPaused) start();
+    }
+
+    @Override protected void onPause() {
+        foreground = false;
+        stopAndSave();
+        super.onPause();
+    }
+
+    @Override protected void onDestroy() {
+        if (coreReady && stopAndSave()) {
+            NativeDs.unload();
+            NativeDs.shutdown();
+            coreReady = false;
+        }
+        super.onDestroy();
+    }
+}

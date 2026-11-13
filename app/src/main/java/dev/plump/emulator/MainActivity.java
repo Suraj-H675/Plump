@@ -73,6 +73,10 @@ public final class MainActivity extends Activity {
         open.setText("Open");
         open.setOnClickListener(v -> openRom());
         bar.addView(open, new LinearLayout.LayoutParams(dp(80), dp(56)));
+        Button ds = new Button(this);
+        ds.setText("DS");
+        ds.setOnClickListener(v -> startActivity(new Intent(this, DsActivity.class)));
+        bar.addView(ds, new LinearLayout.LayoutParams(dp(52), dp(56)));
         pauseButton = new Button(this);
         pauseButton.setText("Pause");
         pauseButton.setOnClickListener(v -> togglePause());
