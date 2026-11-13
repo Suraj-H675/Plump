@@ -27,6 +27,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
 
@@ -174,12 +175,28 @@ public final class MainActivity extends Activity {
                 message("Native save preserved; restore rejected: " + restoreError);
                 return;
             }
+            // A successful JNI call alone does not establish that SRAM was
+            // actually restored into the running core. Verify the complete
+            // saved region before executing any new frames. Never discard or
+            // overwrite an existing save if verification fails.
+            byte[] readback = NativeCore.snapshotSaveRam();
+            if (readback == null || readback.length < recovered.bytes.length ||
+                    !MessageDigest.isEqual(recovered.bytes,
+                            Arrays.copyOf(readback, recovered.bytes.length))) {
+                NativeCore.unloadGame();
+                message("Native save preserved; SRAM restore readback mismatch.");
+                return;
+            }
+            android.util.Log.i("Plump", "Native SRAM restore readback VERIFIED: generation="
+                    + recovered.generation + " bytes=" + recovered.bytes.length);
         }
         gameId = identity;
         gameLoaded = true;
         userPaused = false;
         pauseButton.setText("Pause");
-        message(recovered.warning == null ? "GBA ready — game loaded" : recovered.warning);
+        message(recovered.warning == null ?
+                (recovered.bytes == null ? "GBA ready — game loaded" :
+                        "GBA ready — cartridge SRAM restored and verified") : recovered.warning);
         if (activityResumed) startLoops();
     }
 
