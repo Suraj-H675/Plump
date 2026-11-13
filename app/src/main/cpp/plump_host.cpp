@@ -3,6 +3,7 @@
 #include <android/native_window_jni.h>
 #include <android/log.h>
 #include <dlfcn.h>
+#include "rgb565_blit.hpp"
 
 #include <algorithm>
 #include <array>
@@ -56,6 +57,15 @@ std::atomic<uint32_t> heldButtons{0};
 bool gameLoaded = false;
 double targetFps = 59.7275;
 double sampleRate = 32768.0;
+std::atomic<uint64_t> receivedVideo{0};
+std::atomic<uint64_t> submittedVideo{0};
+std::atomic<uint64_t> failedLocks{0};
+std::atomic<uint64_t> rejectedBuffers{0};
+std::atomic<int32_t> lastBufferFormat{0};
+std::atomic<int32_t> lastWindowError{0};
+std::atomic<int32_t> lastBufferWidth{0};
+std::atomic<int32_t> lastBufferHeight{0};
+std::atomic<uint32_t> lastNonBlackPixels{0};
 
 // Single-producer (core callback), single-consumer (AudioTrack thread), guarded ring.
 constexpr size_t AUDIO_CAPACITY = 131072;
@@ -93,20 +103,53 @@ bool environment(unsigned command, void* data) {
 }
 
 void video(const void* pixels, unsigned w, unsigned h, size_t pitch) {
-    if (!pixels || w != 240 || h != 160 || pitch < w * 2) return;
-    std::lock_guard<std::mutex> lock(windowMutex);
-    if (!window) return;
-    ANativeWindow_Buffer buffer{};
-    if (ANativeWindow_lock(window, &buffer, nullptr) != 0) return;
-    if (buffer.format == WINDOW_FORMAT_RGB_565 && buffer.width >= static_cast<int>(w) &&
-        buffer.height >= static_cast<int>(h) && buffer.bits) {
-        for (unsigned y = 0; y < h; ++y) {
-            auto* dest = static_cast<uint8_t*>(buffer.bits) + y * buffer.stride * 2;
-            auto* src = static_cast<const uint8_t*>(pixels) + y * pitch;
-            std::memcpy(dest, src, w * 2);
-        }
+    const uint64_t frame = ++receivedVideo;
+    if (!pixels || w != 240 || h != 160 || pitch < w * 2) {
+        ++rejectedBuffers;
+        return;
     }
-    ANativeWindow_unlockAndPost(window);
+    if (frame % 180 == 0) {
+        // Read the real upstream pixels independently of the window path.
+        // A nonzero count separates a black core output from failed posting.
+        uint32_t nonBlack = 0;
+        const auto* bytes = static_cast<const uint8_t*>(pixels);
+        for (unsigned y = 0; y < h; ++y) {
+            const auto* row = bytes + static_cast<size_t>(y) * pitch;
+            for (unsigned x = 0; x < w; ++x)
+                nonBlack += (row[x * 2] | row[x * 2 + 1]) != 0;
+        }
+        lastNonBlackPixels.store(nonBlack);
+    }
+    std::lock_guard<std::mutex> lock(windowMutex);
+    if (!window) {
+        ++rejectedBuffers;
+        return;
+    }
+    ANativeWindow_Buffer buffer{};
+    int32_t lockResult = ANativeWindow_lock(window, &buffer, nullptr);
+    if (lockResult != 0) {
+        lastWindowError.store(lockResult);
+        ++failedLocks;
+        return;
+    }
+    lastBufferFormat.store(buffer.format);
+    lastBufferWidth.store(buffer.width);
+    lastBufferHeight.store(buffer.height);
+    bool populated = false;
+    if (buffer.format == WINDOW_FORMAT_RGBA_8888 && buffer.width >= static_cast<int>(w) &&
+        buffer.height >= static_cast<int>(h) && buffer.bits) {
+        blitRgb565ToRgba8888(pixels, pitch, static_cast<uint8_t*>(buffer.bits),
+                            static_cast<size_t>(buffer.stride), w, h);
+        populated = true;
+    } else {
+        ++rejectedBuffers;
+    }
+    const int32_t postResult = ANativeWindow_unlockAndPost(window);
+    if (postResult == 0 && populated) ++submittedVideo;
+    else if (postResult != 0) {
+        ++failedLocks;
+        lastWindowError.store(postResult);
+    }
 }
 
 void audioSample(int16_t left, int16_t right) {
@@ -139,6 +182,13 @@ void releaseGame() {
     romBytes.clear();
     heldButtons.store(0);
     clearAudio();
+    receivedVideo = 0;
+    submittedVideo = 0;
+    failedLocks = 0;
+    rejectedBuffers = 0;
+    lastWindowError = 0;
+    lastBufferFormat = 0;
+    lastNonBlackPixels = 0;
 }
 } // namespace
 
@@ -241,9 +291,27 @@ Java_dev_plump_emulator_NativeCore_setSurface(JNIEnv* env, jclass, jobject surfa
     if (window) { ANativeWindow_release(window); window = nullptr; }
     if (surface) {
         window = ANativeWindow_fromSurface(env, surface);
-        if (window && ANativeWindow_setBuffersGeometry(window, 240, 160, WINDOW_FORMAT_RGB_565) != 0)
-            __android_log_print(ANDROID_LOG_WARN, "Plump", "RGB565 surface configuration failed");
+        if (window) {
+            int32_t result = ANativeWindow_setBuffersGeometry(window, 240, 160, WINDOW_FORMAT_RGBA_8888);
+            lastWindowError.store(result);
+            if (result != 0) __android_log_print(ANDROID_LOG_ERROR, "Plump",
+                 "RGBA8888 native window configuration failed: %d", result);
+        }
     }
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_dev_plump_emulator_NativeCore_videoDiagnostics(JNIEnv* env, jclass) {
+    std::string report = "frames=" + std::to_string(receivedVideo.load()) +
+        " posted=" + std::to_string(submittedVideo.load()) +
+        " nonBlack=" + std::to_string(lastNonBlackPixels.load()) +
+        " lockFail=" + std::to_string(failedLocks.load()) +
+        " reject=" + std::to_string(rejectedBuffers.load()) +
+        " fmt=" + std::to_string(lastBufferFormat.load()) +
+        " size=" + std::to_string(lastBufferWidth.load()) + "x" +
+        std::to_string(lastBufferHeight.load()) +
+        " err=" + std::to_string(lastWindowError.load());
+    return env->NewStringUTF(report.c_str());
 }
 
 extern "C" JNIEXPORT jint JNICALL

@@ -25,6 +25,7 @@ final class NativeCore {
     static native String restoreSaveRam(byte[] bytes);
     static native void setButtons(int mask);
     static native void setSurface(Surface surface);
+    static native String videoDiagnostics();
     static native int drainAudio(short[] samples);
     static native void discardAudio();
     static native double frameRate();

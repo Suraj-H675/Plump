@@ -43,6 +43,7 @@ public final class MainActivity extends Activity {
     private GameSaveStore saveStore;
     private String gameId;
     private volatile long framesRun;
+    private long lastVideoDiagnosticsMs;
     private boolean nativeReady;
     private boolean coreInitialized;
     private boolean gameLoaded;
@@ -226,6 +227,14 @@ public final class MainActivity extends Activity {
                 NativeCore.runFrame();
                 framesRun++;
                 long now = SystemClock.elapsedRealtime();
+                if (now - lastVideoDiagnosticsMs >= 3000) {
+                    lastVideoDiagnosticsMs = now;
+                    String diagnostics = NativeCore.videoDiagnostics();
+                    android.util.Log.i("Plump", "GBA video " + diagnostics);
+                    runOnUiThread(() -> {
+                        if (gameLoaded && !userPaused) message("GBA " + diagnostics);
+                    });
+                }
                 if (now - lastSave >= 30000) {
                     flushNativeSave(false);
                     lastSave = now;

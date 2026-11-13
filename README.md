@@ -33,6 +33,7 @@ Run the following from the repository root:
 ```sh
 export ANDROID_SDK_ROOT="$HOME/Android/Sdk"
 ./scripts/build-mgba-arm64.sh
+./scripts/test-rgb565-renderer.sh
 ./gradlew :app:assembleDebug :app:testDebugUnitTest :app:lintDebug
 ```
 
