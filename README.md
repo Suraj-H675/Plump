@@ -21,9 +21,13 @@ The owner visually verified `hello.gba` rendering and `sram.gba` execution,
 plus basic pause/resume and Android backgrounding. The 32-KiB native cartridge
 save survived a Plump force-stop and cold restart: the core verified it
 byte-for-byte before new frames. The diagnostic APK is `0.1.3-p2-sram-verify`.
-**Audio audibility, actual touchscreen input mapping, corruption recovery and
-real-game performance are not yet device verified.** This is not product-ready;
-DS/3DS integrations remain unselected.
+The owner also verified all mapped GBA buttons including two-finger A+B, audible
+PSG tone response, and recovery of an older cartridge-save generation after a
+newer disposable generation's checksum was deliberately damaged. See
+[P2 device-test report](docs/P2_DEVICE_TEST_REPORT.md). **Long-running audio
+synchronization, performance, broad game compatibility, crash-hardening and
+product-quality UX are not yet verified.** This is not product-ready and P2
+mastermind acceptance remains pending; DS/3DS integrations remain unselected.
 
 ## P2 development build (Android ARM64 only)
 
