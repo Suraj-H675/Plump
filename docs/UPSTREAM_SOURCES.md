@@ -31,3 +31,19 @@ and `save/sram.gba` (SHA-256 `a37ad99c31e3f805eb05a00e498b65bd78e6f43a0a139cd695
 The ROMs are not distributed in the public repository or the standard Plump APK.
 They are loaded explicitly through Android's system document picker after the
 owner authorizes the appropriate device test.
+
+## Original P2 interactive test ROM (not bundled or tracked)
+
+`tests/roms/p2-input-audio.s` is a tiny original ARM7TDMI GBA cartridge test,
+not an emulator or rendered simulation. It reads actual GBA hardware KEYINPUT,
+changes the mode-3 framebuffer for each key and for simultaneous A+B, and
+unmutes a real GBA PSG channel-1 test tone while A is held.
+`scripts/build-p2-input-audio-rom.sh` builds it with the pinned NDK ARM assembler
+and appends the **first 192 bytes of the MIT `ppu/hello.gba` header** (pinned
+SHA-256 and commit above) to make a valid test cartridge. The header's title,
+game code, and checksum are recomputed for Plump. The standard cartridge
+header's original MIT license attribution is preserved here and in the script.
+The generated `app/build/p2-test-fixtures/p2-input-audio.gba` is local-only.
+`tests/roms/verify-p2-input-audio.py` verifies real input-dependent video
+colors, simultaneous A+B and non-silent PSG samples against Linux-host mGBA;
+this does *not* establish Android physical speaker or touch correctness.

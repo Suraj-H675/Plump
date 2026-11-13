@@ -15,13 +15,15 @@ dual-screen layout for DS/3DS-family systems.
   checkpoints, independent per-game resume, and optional local-folder backups.
 - No online account, cloud services, telemetry, or multiplayer.
 
-**Status (2026-11-13):** the P1 technical investigation was accepted. A bounded
-P2 Android GBA test APK has compiled with an in-process, revision-pinned mGBA
-Libretro core, real frame/audio callbacks, touch controls, and a native SRAM
-save coordinator. Host-side test ROM execution and ten JVM tests (save
-integrity and multi-touch input handling) passed.
-**No game has been run inside the Android app or verified on the owner's phone.**
-The app is not product-ready; DS/3DS integrations remain unselected.
+**Status (2026-11-13):** P1 technical feasibility was accepted. The bounded
+P2 ARM64 Android app is **running real mGBA test ROMs on the owner's iQOO Neo 6**.
+The owner visually verified `hello.gba` rendering and `sram.gba` execution,
+plus basic pause/resume and Android backgrounding. The 32-KiB native cartridge
+save survived a Plump force-stop and cold restart: the core verified it
+byte-for-byte before new frames. The diagnostic APK is `0.1.3-p2-sram-verify`.
+**Audio audibility, actual touchscreen input mapping, corruption recovery and
+real-game performance are not yet device verified.** This is not product-ready;
+DS/3DS integrations remain unselected.
 
 ## P2 development build (Android ARM64 only)
 
@@ -34,6 +36,7 @@ Run the following from the repository root:
 export ANDROID_SDK_ROOT="$HOME/Android/Sdk"
 ./scripts/build-mgba-arm64.sh
 ./scripts/test-rgb565-renderer.sh
+./scripts/build-p2-input-audio-rom.sh
 ./gradlew :app:assembleDebug :app:testDebugUnitTest :app:lintDebug
 ```
 
@@ -41,7 +44,12 @@ This generates `app/build/outputs/apk/debug/app-debug.apk`; upstream native
 source and compiled libraries are excluded from Git. The APK contains no game
 ROMs and requests no network or storage-wide Android permissions. Select an
 appropriately licensed local test ROM through Android's document picker.
-**Do not install the P2 APK on the owner's phone without scoped approval.**
+The owner's approved P2 device test permits Plump-only APK updates with app
+data preserved, and isolated licensed/original test ROMs. Device operations
+outside that test scope still require authorization.
+The input/audio test ROM is generated only in ignored `app/build/` using the
+pinned NDK assembler and a checksum-verified MIT-licensed GBA cartridge header;
+the ROM is never bundled into the APK or checked into Git.
 See `docs/UPSTREAM_SOURCES.md` for exact upstream revision and test-fixture
 provenance, and `docs/STATUS.md` for acceptance limitations.
 
