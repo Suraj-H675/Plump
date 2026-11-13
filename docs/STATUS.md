@@ -23,7 +23,14 @@ Both transfers and startup passed, but **the first on-device `hello.gba` display
 remained black**. Local source changes convert mGBA RGB565 into an Android
 RGBA8888 window, expose received/posted/pixel counters, and have a separate
 host-side pixel/stride unit test. This is a candidate diagnosis, not a proven
-device fix: **do not update the existing installation without new approval**.
+device fix. The owner subsequently authorized routine Plump-only P2 test
+updates, and `0.1.1-p2-render` was installed preserving app data. Android
+reported more than 1,200 emulator frames and nearly as many successfully
+posted, with 209 non-black pixels in the source buffer, but the owner-provided
+screenshot still showed an entirely black gameplay region. The likely cause
+is the solid black View background on the SurfaceView, drawn over the native
+surface through Android's window composition. That background was removed in
+`0.1.2-p2-surface`; the revised APK must still be tested on the target phone.
 Remaining acceptance gates include
 GBA-01/02/04/05/06/08 on the actual device: native frame, audio, multi-touch,
 save persistence and Android background/force-stop correctness. The P2 APK

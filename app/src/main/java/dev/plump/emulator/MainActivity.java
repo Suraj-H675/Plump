@@ -84,7 +84,11 @@ public final class MainActivity extends Activity {
                 setMeasuredDimension(width, width * 2 / 3); // Exact GBA 240x160 ratio.
             }
         };
-        screen.setBackgroundColor(Color.BLACK);
+        // SurfaceView's native surface is composited BEHIND the Activity window.
+        // A black View background paints over the transparent window hole and
+        // hides genuine frames even when ANativeWindow_unlockAndPost succeeds.
+        // Keep this View free of a background; the parent already supplies the
+        // initial dark color before the first emulated frame arrives.
         root.addView(screen, new LinearLayout.LayoutParams(-1, -2));
         controls = new ControlsView(this);
         root.addView(controls, new LinearLayout.LayoutParams(-1, 0, 1f));
