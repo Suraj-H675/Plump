@@ -129,3 +129,39 @@ engineering build is not a release.
   `/sdcard/Plump-P3-Test/p3_input_diagnostic.nds` and independently checked
   by on-device SHA-256. No APK upgrade, original GPL fixture modification,
   device configuration change, or access to personal ROMs was involved.
+
+## Synthetic DS EEPROM save fixture (CC0, not a commercial cartridge)
+
+- Source: original CC0 Plump diagnostic in
+  `tests/roms/p3-native-save-diagnostic/source/main.c`. Uses the public
+  BlocksDS `cardReadEeprom`, `cardWriteEeprom`, `sysSetCardOwner`, and regular
+  ARM9 console APIs. The toolchain is the same immutable, offline BlocksDS
+  image pinned above; test source and script contain **no game or firmware
+  dumps**, and do not access personal ROMs or save data.
+- Build: `scripts/build-p3-native-save-diagnostic-rom.sh`. The original
+  compiled BlocksDS homebrew has gamecode `####` and would use a virtual SD
+  card rather than cartridge SRAM. After building, a Python step patches
+  **only our own generated ROM's** gamecode to the invented `P3SV`, and an
+  unused pre-entry secure-area word to the unencrypted marker expected by
+  this pinned melonDS core. This intentionally selects its *retail-classified*
+  8 KB EEPROM path. It is NOT a real retail game and cannot prove retail
+  compatibility, encryption, proprietary firmware, or DS save-chip diversity.
+- Host validation: `scripts/test-p3-native-save-diagnostic.sh` runs two
+  separate processes of the actual pinned Linux melonDS DS core. The first
+  runs the test program, presses A to trigger genuine DS AUX SPI write/read
+  commands, and captures the 8 KB `RETRO_MEMORY_SAVE_RAM` buffer. The second
+  supplies the exact saved bytes before first frame, cold-runs the same
+  program, and confirms its displayed saved-record state differs from fresh
+  EEPROM. `sysSetCardOwner(BUS_OWNER_ARM9)` is essential to give the correct
+  CPU access to the cartridge bus; a first attempt without that authentic
+  operation correctly failed rather than fabricating saved data.
+- Synthetic cartridge SHA-256 after build:
+  `6d863811a7831129b06a0aa07db5955553b69b0fc4748f1fa6e3506de45d4f70`.
+  Generated `.nds` and test SRAM artifacts remain in Git-ignored `app/build/`;
+  binaries are never bundled in APK or committed. **Only host cold-save
+  behavior is verified; the Android two-generation journal still needs a
+  scoped physical force-stop/reopen test.**
+- The synthetic ROM was hash-verified after copying to
+  `/sdcard/Plump-P3-Test/p3_save_diagnostic.nds` alongside the two unchanged
+  licensed fixtures. This is isolated diagnostic storage, not a new APK
+  installation, not an emulator-source change and not a user-owned game.

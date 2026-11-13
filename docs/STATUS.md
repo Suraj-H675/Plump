@@ -1,6 +1,6 @@
 # Plump development status
 
-Last documented: 2026-11-13 (P2 mastermind accepted; P3 on-device screens/lifecycle, host-verified interactive DS stylus+chord+PSG, phone input/audio pending).
+Last documented: 2026-11-13 (P2 accepted; P3 fixture-level physical DS input/audio and host DS EEPROM cold save verified; Android cold save pending).
 
 | Area | Status |
 |---|---|
@@ -14,7 +14,7 @@ Last documented: 2026-11-13 (P2 mastermind accepted; P3 on-device screens/lifecy
 | Save and recovery integrity | Real `sram.gba` on iQOO wrote two valid 32-KiB SRAM generations with expected ROM writes; both independently read and checksummed. Plump force-stop/cold launch verified full 32,768-byte core restore of generation 2. A separate disposable diagnostic ROM recovered generation 4 after the newer generation 5 checksum was corrupted. Both test generations restored from backup afterward |
 | Offline operation | Manifest declares no Internet permission and excludes platform backups; runtime offline behavior still unverified |
 | GitHub remote | Existing public Suraj-H675/Plump; accepted P2 batch pushed at `d1cef15`; P3 local only |
-| Local development | P2 GBA device tests accepted; pinned melonDS DS ARM64 and host core built. CC0 BlocksDS DS diagnostic runs real ARM9/ARM7 homebrew with precise 3-point stylus response, release, simultaneous A+B+touch and PSG sample audio in host melonDS; new ROM copied to isolated P3 device folder with matching checksum; no further APK update |
+| Local development | P2 GBA accepted; pinned melonDS DS Android/host core built. Owner confirms CC0 DS touch+chord+PSG tests on phone. A separate CC0 **synthetic retail-classified** EEPROM test performs real DS SPI write/read and two-process host cold load for 8 KB save RAM; Android app save journal cold-load remains pending |
 
 The owner authorized initial installation of APK SHA-256
 `93b3fa9e4fbe2dd398f388c0bc72c9b2f96e652d8460a6217ee73825c72da612`

@@ -40,9 +40,14 @@ and normal START-controlled test-ROM power-off. A new CC0 interactive DS
 homebrew fixture passed host checks for exact stylus coordinates, simultaneous
 A+B+stylus and native PSG tone samples; the generated ROM was transferred
 to the existing isolated P3 fixture folder, awaiting real phone interaction.
-**P3 is not accepted**: physical stylus accuracy, simultaneous input,
-audible DS sound, native DS cartridge save recovery, and sustained performance
-remain unverified. See [P3 technical report](docs/P3_TECHNICAL_REPORT.md).
+**P3 is not accepted**: the owner has now confirmed physical touchscreen
+accuracy, simultaneous touch+A+B, enlarged-screen mapping, and audible PSG
+for the CC0 fixture. Additionally, a distinct original CC0 synthetic DS
+cartridge passed authentic emulated EEPROM writes and in-game cold recovery
+in two separate host core processes. **Android cold cartridge-save recovery,
+additional safe-area layouts, supported save-state behavior and sustained
+performance remain unverified.** See
+[P3 technical report](docs/P3_TECHNICAL_REPORT.md).
 
 ## P2 development build (Android ARM64 only)
 
@@ -85,6 +90,7 @@ export TMPDIR="$PWD/app/build/p3-tmp"
 ./scripts/build-melonds-ds-arm64.sh
 ./scripts/test-melonds-ds-host.sh
 ./scripts/test-p3-input-diagnostic.sh
+./scripts/test-p3-native-save-diagnostic.sh
 ./scripts/test-nds-frame-split.sh
 ./scripts/test-rgb565-renderer.sh
 ./gradlew --no-daemon :app:assembleDebug :app:testDebugUnitTest :app:lintDebug

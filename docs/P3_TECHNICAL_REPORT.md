@@ -118,6 +118,23 @@ exit rather than a crash. These observations prove the initial physical
 dual-screen slice and tested lifecycle, **not** sustained performance, audio,
 accurate touchscreen/drag or DS native cartridge saves.
 
+### Interactive DS controls and audible PSG: physical phone validation
+
+The owner then opened the independently SHA-256-verified CC0
+`p3_input_diagnostic.nds` and confirmed **all four** scripted checks on the
+iQOO Neo 6: the real upper/lower DS panels appeared; finger taps and drags
+moved the native lower-screen marker while the game's X/Y values changed;
+touch remained aligned after enlarging the lower display; and pressing A
+produced an audible tone which stopped when released. The owner also confirmed
+that simultaneous A+B and an active lower-screen finger kept the marker
+visible and correctly displayed both button inputs.
+
+**Evidence level:** owner-verified on the actual Android phone for this
+diagnostic fixture, supported by independent host pointer/chord/audio tests.
+This is not instrument-grade touch-error measurement, broad title support,
+extended audio sync or thermally sustained performance validation. The APK
+remained at approved version code 5; no update was needed.
+
 ### Interactive DS input/audio fixture: genuine host execution
 
 A small, reproducible **CC0-licensed ARM9+ARM7 NDS program** was derived from
@@ -146,7 +163,53 @@ Diagnostic ROM SHA-256:
 `109b7c302ade948e73b8b52081c37a380d8f1ea6a4c1be2cee062e1cd304482d`.
 It was transferred to the existing isolated
 `/sdcard/Plump-P3-Test/p3_input_diagnostic.nds`, and its on-device hash was
-verified. No new APK was built or installed. Phone interaction remains next.
+verified. No new APK was built or installed. The owner subsequently reported
+all four real-phone interaction checks passed (documented above).
+
+### Native DS cartridge EEPROM: distinct synthetic host cold-load proof
+
+To investigate DS-07 without using personal or copyrighted commercial ROMs,
+Plump now builds an original **CC0-licensed ARM9 EEPROM test** with BlocksDS.
+A private generated copy receives an invented `P3SV` gamecode and a decrypted
+secure-area marker to exercise melonDS's ordinary retail-classified 8 KB
+EEPROM emulation rather than the virtual SD card used by homebrew. It is an
+explicitly **synthetic test cartridge**, not a retail game or general
+compatibility test. No Nintendo system files were downloaded or installed.
+
+The program uses real DS AUX SPI commands (`cardWriteEeprom` and
+`cardReadEeprom`) to write and immediately read a 16-byte self-checked
+diagnostic record at offset `0x180`. The fixture initially failed because
+Slot-1 bus ownership had not been assigned to ARM9; the authentic hardware
+call `sysSetCardOwner(BUS_OWNER_ARM9)` resolved the failure without weakening
+the test or changing upstream melonDS. `scripts/test-p3-native-save-diagnostic.sh`
+boots the genuine core in **two independent host processes**. The first
+process writes EEPROM and extracts the core's `RETRO_MEMORY_SAVE_RAM`; a
+second process loads exactly those saved 8 KB *before the first frame*, runs
+the actual cartridge code, and checks distinct on-screen CRCs to confirm
+the program saw its restored record. Test-only saves remain in ignored scratch.
+
+```text
+synthetic ROM SHA-256: 6d863811a7831129b06a0aa07db5955553b69b0fc4748f1fa6e3506de45d4f70
+Stage=first synthetic cartridge SRAM bytes=8192
+SRAM data at 0x180 504c4d502d44533301feac5301020304
+PASS FIRST: in-game EEPROM write, immediate SPI readback, cartridge memory snapshot
+Stage=cold synthetic cartridge SRAM bytes=8192
+SRAM data at 0x180 504c4d502d44533301feac5301020304
+PASS COLD: separate-process SRAM restored into core and read in-game
+```
+
+This supports the **host native EEPROM/save API integration only**. It does
+not yet verify Android journal write/recovery, force-stop/cold restart,
+power-loss handling, retail titles or cross-core save compatibility. A
+separately scoped, non-personal phone test is still required for DS-07.
+
+The synthetic `p3_save_diagnostic.nds` was subsequently copied **only** to
+the isolated `/sdcard/Plump-P3-Test/` directory. Android-device SHA-256 matched
+the exact generated ROM, with both earlier fixtures still unchanged. The
+installed Plump APK stayed at version code 5; existing six P2 GBA save files
+were confirmed present in read-only app-private metadata. The owner has not
+yet performed the in-game EEPROM write, pause, or cold-open verification on
+the target phone, so physical DS-07 remains **pending**.
 
 ## Android candidate and verification level
 
@@ -154,14 +217,14 @@ verified. No new APK was built or installed. Phone interaction remains next.
 |---|---|---|
 | DS-01 real execution and 2 screens | Host ran 100 frames; both 256×192 panels extracted; owner screenshot shows genuine DS test text and both physical screens with 1,443 presented frames | **Initial fixture device pass; broader games pending** |
 | DS-02 portrait layout | Upper larger, smaller lower centered between controls in owner screenshot | **Default physical layout observed** |
-| DS-03 touchscreen tap/drag | Host-marker test verifies three exact DS coordinates and release; Android native mapper shares same formula | **Host verified; phone touch response pending** |
-| DS-04 concurrent touch and buttons | Host game changed live A+B state during stylus without losing marker; JVM simultaneous input tests | **Host verified; physical simultaneous input pending** |
-| DS-05 lower enlargement | Owner confirmed lower grows with toggle; native touch transform invariants tested on host | **Physical enlargement pass; enlarged-mode touch accuracy pending** |
+| DS-03 touchscreen tap/drag | Host marker correct at three exact DS coordinates, owner verified taps, drag and X/Y updates on phone | **Fixture-level physical pass** |
+| DS-04 concurrent touch and buttons | Host and phone both verified A+B while lower stylus marker stays active | **Fixture-level physical pass** |
+| DS-05 lower enlargement | Owner confirmed correct finger-marker alignment before and after lower enlargement | **Fixture-level physical pass** |
 | DS-06 layouts/insets | 4 lower display widths exercised in JVM tests; Android `fitsSystemWindows` set | **3 real layouts, safe areas and accessibility pending** |
-| DS-07 native save persistence | Existing checksummed two-generation `GameSaveStore` reused for separate `nds-native-saves` and SHA-256 game ID; restore readback before frames | **Store tests pass; no DS cartridge SRAM cold test** |
+| DS-07 native save persistence | Separate two-generation `nds-native-saves` journal; synthetic real DS SPI EEPROM write and in-game cold restoration pass in two host processes | **Host EEPROM proof; Android cold save still pending** |
 | DS-08 save states | No DS save-state UI or serializing JNI exposed; no false save-state claims | **Not implemented; future P3 decision** |
 | DS-09 DSi | Forced DS mode; no licensed DSi BIOS/firmware/NAND | **Not implemented; explicit gaps below** |
-| Audio and lifecycle | Owner verified Pause/Resume and Home/Recents; genuine PSG samples in new host ROM | **Device lifecycle pass for memory fixture; audible DS PSG pending** |
+| Audio and lifecycle | Owner verified Pause/Resume, Home/Recents and audible PSG while holding A, which stops when released | **Fixture-level physical pass; extended synchronization pending** |
 | Performance | Actual device screen showed 1,443/1,443 posted, zero rejected, average/peak 8/17 ms core time | **Short interval observed; sustained pacing unverified** |
 | GBA regression | mGBA native core and `native-saves` directory unchanged; host GBA pixel test, existing save/button JVM tests and APK build pass | **Source/build regression check only; device retest pending** |
 
@@ -177,10 +240,11 @@ and asset notices must be reviewed before any public binary distribution.
 DS cartridge save RAM, when exposed by `RETRO_MEMORY_SAVE_RAM`, uses Plump's
 existing checksum-generation journal, in a directory separate from P2 GBA
 data. A failed save or unsupported size greater than 1 MiB is reported and
-game switching is blocked, not falsely marked successful. The actual DS
-cartridge save path has **not** survived a cold restart test yet.
+game switching is blocked, not falsely marked successful. A synthetic
+cartridge **has passed two-process host cold-load**, but Plump's Android
+two-generation journal has **not** passed force-stop/reopen testing yet.
 
-The selected DS fixture is **homebrew**, which uses the core's separate
+The earlier DS fixtures are **homebrew**, which uses the core's separate
 virtual SD-card image instead of cartridge SRAM (`cart_sram_bytes=0`). The
 virtual SD card is currently **not backed by the two-generation save store**.
 Homebrew save persistence and corruption recovery are NOT verified and must
