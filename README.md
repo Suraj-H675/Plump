@@ -39,14 +39,18 @@ dual-screen output, lower enlargement, pause/resume, Android background return,
 and normal START-controlled test-ROM power-off. A new CC0 interactive DS
 homebrew fixture passed host checks for exact stylus coordinates, simultaneous
 A+B+stylus and native PSG tone samples; the generated ROM was transferred
-to the existing isolated P3 fixture folder, awaiting real phone interaction.
+to the existing isolated P3 fixture folder and its interactions were also
+verified by the owner on the actual phone.
 **P3 is not accepted**: the owner has now confirmed physical touchscreen
 accuracy, simultaneous touch+A+B, enlarged-screen mapping, and audible PSG
 for the CC0 fixture. Additionally, a distinct original CC0 synthetic DS
 cartridge passed authentic emulated EEPROM writes and in-game cold recovery
-in two separate host core processes. **Android cold cartridge-save recovery,
-additional safe-area layouts, supported save-state behavior and sustained
-performance remain unverified.** See
+in two separate host core processes **and on the owner's actual phone**:
+two valid 8-KiB cartridge-save generations survived a Plump-only force-stop,
+the emulator byte-verified restored generation 2, and the game reported
+`Initial save: RESTORED` with counter 1 after cold relaunch. **Engine-change
+save handling, additional safe-area layouts, supported save-state behavior,
+multi-title compatibility and sustained performance remain unverified.** See
 [P3 technical report](docs/P3_TECHNICAL_REPORT.md).
 
 ## P2 development build (Android ARM64 only)
