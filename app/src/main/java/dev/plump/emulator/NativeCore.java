@@ -22,7 +22,14 @@ final class NativeCore {
     static native String loadGame(byte[] rom);
     static native void runFrame();
     static native byte[] snapshotSaveRam();
-    static native String restoreSaveRam(byte[] bytes);
+    static String restoreSaveRam(byte[] bytes) {
+        if (bytes == null) return "No saved SRAM data";
+        int coreSize = saveRamSize();
+        String sizeError = SaveRamSizeValidator.restoreError(bytes.length, coreSize);
+        return sizeError == null ? restoreSaveRamChecked(bytes) : sizeError;
+    }
+    private static native int saveRamSize();
+    private static native String restoreSaveRamChecked(byte[] bytes);
     static native void setButtons(int mask);
     static native void setSurface(Surface surface);
     static native String videoDiagnostics();

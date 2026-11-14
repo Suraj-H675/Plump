@@ -55,6 +55,7 @@ ANativeWindow* window = nullptr;
 std::vector<uint8_t> romBytes;
 std::atomic<uint32_t> heldButtons{0};
 bool gameLoaded = false;
+bool hasRunFrame = false;
 double targetFps = 59.7275;
 double sampleRate = 32768.0;
 std::atomic<uint64_t> receivedVideo{0};
@@ -179,6 +180,7 @@ jstring error(JNIEnv* env, const std::string& message) {
 void releaseGame() {
     if (gameLoaded) core.unload();
     gameLoaded = false;
+    hasRunFrame = false;
     romBytes.clear();
     heldButtons.store(0);
     clearAudio();
@@ -245,13 +247,14 @@ Java_dev_plump_emulator_NativeCore_loadGame(JNIEnv* env, jclass, jbyteArray byte
     targetFps = av.timing.fps > 1 && av.timing.fps < 200 ? av.timing.fps : 59.7275;
     sampleRate = av.timing.sampleRate > 8000 && av.timing.sampleRate < 192000 ? av.timing.sampleRate : 32768.0;
     gameLoaded = true;
+    hasRunFrame = false;
     return nullptr;
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_dev_plump_emulator_NativeCore_runFrame(JNIEnv*, jclass) {
     std::lock_guard<std::mutex> lock(coreMutex);
-    if (gameLoaded) core.run();
+    if (gameLoaded) { core.run(); hasRunFrame = true; }
 }
 
 extern "C" JNIEXPORT jbyteArray JNICALL
@@ -266,15 +269,33 @@ Java_dev_plump_emulator_NativeCore_snapshotSaveRam(JNIEnv* env, jclass) {
     return result;
 }
 
+extern "C" JNIEXPORT jint JNICALL
+Java_dev_plump_emulator_NativeCore_saveRamSize(JNIEnv*, jclass) {
+    std::lock_guard<std::mutex> lock(coreMutex);
+    if (!gameLoaded) return 0;
+    size_t length = core.memorySize(0);
+    void* ptr = core.memoryData(0);
+    if (!ptr || length == 0 || length > 1024 * 1024) return 0;
+    return static_cast<jint>(length);
+}
+
 extern "C" JNIEXPORT jstring JNICALL
-Java_dev_plump_emulator_NativeCore_restoreSaveRam(JNIEnv* env, jclass, jbyteArray data) {
+Java_dev_plump_emulator_NativeCore_restoreSaveRamChecked(JNIEnv* env, jclass, jbyteArray data) {
     std::lock_guard<std::mutex> lock(coreMutex);
     if (!gameLoaded || !data) return error(env, "No loaded core or save");
     const jsize size = env->GetArrayLength(data);
     const size_t capacity = core.memorySize(0);
     void* ptr = core.memoryData(0);
-    if (!ptr || size <= 0 || static_cast<size_t>(size) > capacity)
-        return error(env, "Save RAM size is not compatible with this core");
+    // Only pinned mGBA's verified pre-first-frame SRAM autodetection case:
+    // 32 KiB PLSV v1 SRAM into its still-undetected 128 KiB save buffer.
+    // The game then identifies SRAM32K when it starts. Reject all other
+    // length mismatches, especially after the emulator has run any frames.
+    const bool legacySram = !hasRunFrame && size == 32 * 1024 && capacity == 128 * 1024;
+    if (!ptr || capacity == 0 || capacity > 1024 * 1024 || size <= 0 ||
+            (static_cast<size_t>(size) != capacity && !legacySram))
+        return error(env, "Native save size does not match the loaded core");
+    if (legacySram)
+        std::memset(static_cast<uint8_t*>(ptr) + size, 0xFF, capacity - size);
     env->GetByteArrayRegion(data, 0, size, static_cast<jbyte*>(ptr));
     if (env->ExceptionCheck()) return error(env, "Unable to copy save RAM");
     return nullptr;

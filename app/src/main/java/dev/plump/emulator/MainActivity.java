@@ -184,7 +184,8 @@ public final class MainActivity extends Activity {
             // saved region before executing any new frames. Never discard or
             // overwrite an existing save if verification fails.
             byte[] readback = NativeCore.snapshotSaveRam();
-            if (readback == null || readback.length < recovered.bytes.length ||
+            if (readback == null || !SaveRamSizeValidator.supportsRestore(
+                    recovered.bytes.length, readback.length) ||
                     !MessageDigest.isEqual(recovered.bytes,
                             Arrays.copyOf(readback, recovered.bytes.length))) {
                 NativeCore.unloadGame();
