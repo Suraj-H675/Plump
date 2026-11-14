@@ -39,6 +39,8 @@ public final class DsActivity extends Activity {
     private static final int MAX_ROM = 64 * 1024 * 1024;
     private final AtomicBoolean running = new AtomicBoolean();
     private final AtomicInteger audioUnderruns = new AtomicInteger();
+    private final EmulatorSessionOwner sessionOwner = EmulatorSessionOwner.process();
+    private EmulatorSessionOwner.HostToken hostToken;
     private Thread emulatorThread, audioThread;
     private DsControlsView left, right;
     private TouchPanel bottom;
@@ -49,12 +51,18 @@ public final class DsActivity extends Activity {
     private GameSaveStore saveStore;
     private String gameId;
     private long frames, lastStats;
-    private boolean coreReady, loaded, userPaused, foreground, enlarged;
+    private boolean coreReady, loaded, nativeGameLoaded, userPaused, foreground, enlarged;
+    private volatile long runToken;
     private int measuredContentWidth, measuredContentHeight;
 
     private int dp(float value) { return (int) (getResources().getDisplayMetrics().density * value + .5f); }
     private void message(String message) { status.setText(message); }
-    private void error(String message) { runOnUiThread(() -> message(message)); }
+    private void error(String message, long callbackRun) {
+        runOnUiThread(() -> {
+            if (hostToken != null && sessionOwner.isCurrentHost(hostToken) && runToken == callbackRun)
+                message(message);
+        });
+    }
 
     private final class TouchPanel extends SurfaceView {
         private int pointerId = -1;
@@ -71,7 +79,8 @@ public final class DsActivity extends Activity {
 
         void release() {
             pointerId = -1;
-            if (coreReady) NativeDs.touch(false, 0, 0);
+            if (coreReady && hostToken != null && sessionOwner.isCurrentHost(hostToken))
+                NativeDs.touch(false, 0, 0);
         }
 
         @Override public boolean onTouchEvent(MotionEvent event) {
@@ -89,7 +98,8 @@ public final class DsActivity extends Activity {
             if (index < 0) return true;
             float x = event.getX(index), y = event.getY(index);
             boolean inside = DsTouchMapper.inside(x, y, getWidth(), getHeight());
-            if (coreReady) NativeDs.touch(inside,
+            if (coreReady && hostToken != null && sessionOwner.isCurrentHost(hostToken) &&
+                    (inside ? sessionOwner.isCurrentRun(hostToken, runToken) : true)) NativeDs.touch(inside,
                     DsTouchMapper.x(x, getWidth()), DsTouchMapper.y(y, getHeight()));
             return true;
         }
@@ -113,7 +123,7 @@ public final class DsActivity extends Activity {
         status = new TextView(this);
         status.setTextColor(Color.WHITE);
         status.setTextSize(12);
-        status.setText("DS — choose a local .nds test ROM");
+        status.setText("DS — reselect a ROM after restart; native cartridge save is the fallback, no frame resume");
         status.setPadding(dp(8), 0, dp(4), 0);
         toolbar.addView(status, new LinearLayout.LayoutParams(0, dp(56), 1));
         Button open = new Button(this);
@@ -136,11 +146,18 @@ public final class DsActivity extends Activity {
         top.setContentDescription("Nintendo DS upper 256 by 192 display");
         root.addView(top, new LinearLayout.LayoutParams(-1, -2));
         top.getHolder().addCallback(new SurfaceHolder.Callback() {
-            @Override public void surfaceCreated(SurfaceHolder holder) { if (coreReady) NativeDs.topSurface(holder.getSurface()); }
-            @Override public void surfaceChanged(SurfaceHolder holder, int format, int w, int h) {
-                if (coreReady) NativeDs.topSurface(holder.getSurface());
+            @Override public void surfaceCreated(SurfaceHolder holder) {
+                if (hostToken != null && sessionOwner.isCurrentHost(hostToken) && coreReady)
+                    NativeDs.topSurface(holder.getSurface());
             }
-            @Override public void surfaceDestroyed(SurfaceHolder holder) { if (coreReady) NativeDs.topSurface(null); }
+            @Override public void surfaceChanged(SurfaceHolder holder, int format, int w, int h) {
+                if (hostToken != null && sessionOwner.isCurrentHost(hostToken) && coreReady)
+                    NativeDs.topSurface(holder.getSurface());
+            }
+            @Override public void surfaceDestroyed(SurfaceHolder holder) {
+                if (hostToken != null && sessionOwner.isCurrentHost(hostToken) && coreReady)
+                    NativeDs.topSurface(null);
+            }
         });
 
         expandButton = new Button(this);
@@ -175,13 +192,18 @@ public final class DsActivity extends Activity {
         });
         root.post(() -> updateLowerLayout(root.getWidth(), root.getHeight()));
         bottom.getHolder().addCallback(new SurfaceHolder.Callback() {
-            @Override public void surfaceCreated(SurfaceHolder holder) { if (coreReady) NativeDs.bottomSurface(holder.getSurface()); }
+            @Override public void surfaceCreated(SurfaceHolder holder) {
+                if (hostToken != null && sessionOwner.isCurrentHost(hostToken) && coreReady)
+                    NativeDs.bottomSurface(holder.getSurface());
+            }
             @Override public void surfaceChanged(SurfaceHolder holder, int format, int w, int h) {
-                if (coreReady) NativeDs.bottomSurface(holder.getSurface());
+                if (hostToken != null && sessionOwner.isCurrentHost(hostToken) && coreReady)
+                    NativeDs.bottomSurface(holder.getSurface());
             }
             @Override public void surfaceDestroyed(SurfaceHolder holder) {
                 bottom.release();
-                if (coreReady) NativeDs.bottomSurface(null);
+                if (hostToken != null && sessionOwner.isCurrentHost(hostToken) && coreReady)
+                    NativeDs.bottomSurface(null);
             }
         });
 
@@ -207,11 +229,39 @@ public final class DsActivity extends Activity {
                     if (fd != null) try { Os.close(fd); } catch (android.system.ErrnoException ignored) { }
                 }
             });
-            String issue = NativeDs.initialize(sys.getAbsolutePath(), coreSaves.getAbsolutePath());
-            if (issue != null) { message("Cannot initialize melonDS: " + issue); return; }
-            coreReady = true;
+            hostToken = sessionOwner.attach(EmulatorSessionOwner.Console.DS, new EmulatorSessionOwner.Host() {
+                @Override public boolean initializeCore() {
+                    if (NativeDs.LOAD_ERROR != null) {
+                        message("DS core library unavailable: " + NativeDs.LOAD_ERROR);
+                        return false;
+                    }
+                    String issue = NativeDs.initialize(sys.getAbsolutePath(), coreSaves.getAbsolutePath());
+                    if (issue != null) { message("Cannot initialize melonDS: " + issue); return false; }
+                    coreReady = true;
+                    return true;
+                }
+                @Override public boolean stopAndSave() { return DsActivity.this.stopAndSave(); }
+                @Override public boolean startLoops(long token) { return startOwnedLoops(token); }
+                @Override public void unloadGame() {
+                    if (nativeGameLoaded) NativeDs.unload();
+                    nativeGameLoaded = loaded = false;
+                    gameId = null;
+                    frames = 0;
+                }
+                @Override public void shutdownCore() {
+                    if (coreReady) NativeDs.shutdown();
+                    coreReady = false;
+                }
+            }, new SessionReceiptStore(new File(getFilesDir(), "session-receipts").toPath()));
+            if (!sessionOwner.initialize(hostToken)) {
+                message("DS core initialization failed or a previous host is unresolved");
+                return;
+            }
             if (top.getHolder().getSurface().isValid()) NativeDs.topSurface(top.getHolder().getSurface());
             if (bottom.getHolder().getSurface().isValid()) NativeDs.bottomSurface(bottom.getHolder().getSurface());
+            message("Select a DS ROM. After Activity or process recreation, native cartridge save is the fallback; exact-frame resume is unavailable.");
+        } catch (IllegalStateException unavailable) {
+            message("DS session still needs recovery; this Activity cannot reattach safely");
         } catch (IOException failure) {
             message("DS private storage unavailable: " + failure.getMessage());
         }
@@ -267,7 +317,10 @@ public final class DsActivity extends Activity {
     }
 
     private void sendButtons() {
-        if (coreReady && left != null && right != null) NativeDs.buttons(left.mask() | right.mask());
+        if (coreReady && hostToken != null && sessionOwner.isCurrentHost(hostToken) && left != null && right != null) {
+            int mask = left.mask() | right.mask();
+            if (mask == 0 || sessionOwner.isCurrentRun(hostToken, runToken)) NativeDs.buttons(mask);
+        }
     }
 
     private void openRom() {
@@ -285,40 +338,57 @@ public final class DsActivity extends Activity {
         byte[] bytes;
         try { bytes = readRom(data.getData()); }
         catch (IOException failure) { message("Cannot read DS file: " + failure.getMessage()); return; }
-        if (!stopAndSave()) { message("Previous DS session did not stop safely"); return; }
-        if (loaded) NativeDs.unload();
-        loaded = false;
-        gameId = null;
-        frames = 0;
-        String issue = NativeDs.load(bytes);
-        if (issue != null) { message("DS ROM rejected: " + issue); return; }
         String identity = identity(bytes);
-        GameSaveStore.Recovery prior = saveStore.load(identity);
-        if (prior.warning != null && prior.bytes == null) {
-            NativeDs.unload();
-            message("Corrupt DS save preserved; refusing to start the cartridge");
+        final GameSaveStore.Recovery[] recovery = new GameSaveStore.Recovery[1];
+        EmulatorSessionOwner.OpenResult opened = sessionOwner.open(hostToken, identity,
+                new EmulatorSessionOwner.GameLoader() {
+                    @Override public String loadAndRestore() {
+                        String issue = NativeDs.load(bytes);
+                        if (issue != null) return "DS ROM rejected: " + issue;
+                        nativeGameLoaded = true;
+                        GameSaveStore.Recovery prior = saveStore.load(identity);
+                        recovery[0] = prior;
+                        if (prior.warning != null && prior.bytes == null)
+                            return "Corrupt DS save preserved; refusing to start the cartridge";
+                        if (prior.bytes != null) {
+                            String restoreError = NativeDs.restore(prior.bytes);
+                            byte[] checked = restoreError == null ? NativeDs.snapshot() : null;
+                            if (restoreError != null || checked == null || !Arrays.equals(prior.bytes, checked))
+                                return "DS save preserved; core restore validation failed";
+                            android.util.Log.i("PlumpDS", "DS cartridge save restored and byte-verified: generation=" + prior.generation);
+                        }
+                        loaded = true;
+                        gameId = identity;
+                        frames = 0;
+                        userPaused = false;
+                        return null;
+                    }
+
+                    @Override public void discardFailedLoad() {
+                        if (nativeGameLoaded) NativeDs.unload();
+                        nativeGameLoaded = loaded = false;
+                        gameId = null;
+                        frames = 0;
+                    }
+                });
+        if (!opened.opened) {
+            message("DS ROM/session open failed: " + opened.error);
             return;
         }
-        if (prior.bytes != null) {
-            String restoreError = NativeDs.restore(prior.bytes);
-            byte[] checked = restoreError == null ? NativeDs.snapshot() : null;
-            if (restoreError != null || checked == null || !Arrays.equals(prior.bytes, checked)) {
-                NativeDs.unload();
-                message("DS save preserved; core restore validation failed");
-                return;
-            }
-            android.util.Log.i("PlumpDS", "DS cartridge save restored and byte-verified: generation=" + prior.generation);
-        }
-        loaded = true;
-        gameId = identity;
-        userPaused = false;
         pauseButton.setText("Pause");
-        message(prior.warning != null ? prior.warning :
-                (NativeDs.saveSize() == 0 ? "DS loaded — homebrew SD storage is experimental; not backed up" :
+        GameSaveStore.Recovery prior = recovery[0];
+        String ready = prior.warning != null ? prior.warning :
+                (NativeDs.saveSize() == 0 ? "DS loaded — no cartridge save region; virtual SD is disabled" :
                         NativeDs.saveSize() > 1024 * 1024 ?
                         "DS loaded — unsupported cartridge-save size; do not rely on saving" :
-                        "DS loaded — native cartridge save active"));
-        if (foreground) start();
+                        "DS loaded — native cartridge save active");
+        if (opened.previousReceipt.corrupt)
+            ready += " — prior session receipt is corrupt; no frame resume";
+        else if (opened.previousReceipt.state == SessionReceiptStore.State.RUNNING)
+            ready += " — last receipt says RUNNING; no frame resume";
+        message(ready);
+        if (foreground && !sessionOwner.resume(hostToken))
+            message("DS loaded, but run start is blocked by an unresolved session transition");
     }
 
     private byte[] readRom(Uri file) throws IOException {
@@ -347,27 +417,38 @@ public final class DsActivity extends Activity {
 
     private void togglePause() {
         if (!loaded) { message("Choose an NDS test ROM first"); return; }
-        userPaused = !userPaused;
-        if (userPaused) {
-            boolean saved = stopAndSave();
-            message(saved ? "DS paused — cartridge save flushed where available" : "DS paused — save failed");
+        if (!userPaused) {
+            userPaused = true;
             pauseButton.setText("Resume");
+            boolean saved = sessionOwner.pause(hostToken);
+            message(saved ? "DS paused — native save and session receipt flushed where available"
+                    : "DS pause unresolved — save or receipt failed; switching and resume are blocked");
         } else {
-            pauseButton.setText("Pause");
-            if (foreground) start();
+            if (!foreground) return;
+            userPaused = false;
+            if (sessionOwner.resume(hostToken)) pauseButton.setText("Pause");
+            else {
+                userPaused = true;
+                message("DS resume blocked until stop, save and receipt are resolved");
+            }
         }
     }
 
-    private void start() {
-        if (!loaded || !coreReady || !foreground || userPaused || !running.compareAndSet(false, true)) return;
+    private boolean startOwnedLoops(long token) {
+        if (!loaded || !coreReady || !foreground || userPaused) return false;
+        if ((emulatorThread != null && emulatorThread.isAlive()) || (audioThread != null && audioThread.isAlive()))
+            return false;
+        if (!running.compareAndSet(false, true)) return false;
+        runToken = token;
         lastStats = SystemClock.elapsedRealtime();
         audioUnderruns.set(0);
+        try {
         emulatorThread = new Thread(() -> {
             long period = (long) (1_000_000_000.0 / NativeDs.rate());
             long deadline = System.nanoTime();
             long previousSave = SystemClock.elapsedRealtime();
             DsFrameTiming timings = new DsFrameTiming();
-            while (running.get()) {
+            while (running.get() && sessionOwner.isCurrentRun(hostToken, token)) {
                 long start = System.nanoTime();
                 NativeDs.frame();
                 long frameNs = System.nanoTime() - start;
@@ -387,11 +468,13 @@ public final class DsActivity extends Activity {
                             "ms p99Core=" + timings.percentileMillis(99) +
                             "ms audioUnderruns=" + audioUnderruns.get();
                     android.util.Log.i("PlumpDS", metrics);
-                    runOnUiThread(() -> { if (loaded && !userPaused) message("DS " + metrics); });
+                    runOnUiThread(() -> {
+                        if (sessionOwner.isCurrentRun(hostToken, token)) message("DS " + metrics);
+                    });
                     timings.reset();
                 }
                 if (now - previousSave >= 30_000) {
-                    save(false);
+                    save(false, token);
                     previousSave = now;
                 }
                 deadline += period;
@@ -401,11 +484,18 @@ public final class DsActivity extends Activity {
             }
         }, "Plump-DS-core");
         emulatorThread.start();
-        audioThread = new Thread(this::pumpAudio, "Plump-DS-audio");
+        audioThread = new Thread(() -> pumpAudio(token), "Plump-DS-audio");
         audioThread.start();
+        return true;
+        } catch (RuntimeException failure) {
+            running.set(false);
+            join(emulatorThread);
+            join(audioThread);
+            return false;
+        }
     }
 
-    private void pumpAudio() {
+    private void pumpAudio(long token) {
         AudioTrack output = null;
         try {
             int rate = NativeDs.audioRate();
@@ -421,7 +511,7 @@ public final class DsActivity extends Activity {
             output.play();
             short[] samples = new short[2048];
             long lastUnderrunSample = SystemClock.elapsedRealtime();
-            while (running.get()) {
+            while (running.get() && sessionOwner.isCurrentRun(hostToken, token)) {
                 long now = SystemClock.elapsedRealtime();
                 if (now - lastUnderrunSample >= 1000) {
                     audioUnderruns.set(output.getUnderrunCount());
@@ -430,7 +520,7 @@ public final class DsActivity extends Activity {
                 int size = NativeDs.drain(samples);
                 if (size == 0) { SystemClock.sleep(5); continue; }
                 int written = 0;
-                while (written < size && running.get()) {
+                while (written < size && running.get() && sessionOwner.isCurrentRun(hostToken, token)) {
                     int result = output.write(samples, written, size - written, AudioTrack.WRITE_NON_BLOCKING);
                     if (result < 0) throw new IllegalStateException("PCM output failed: " + result);
                     if (result == 0) SystemClock.sleep(3);
@@ -438,8 +528,9 @@ public final class DsActivity extends Activity {
                 }
             }
         } catch (Exception failure) {
-            error("DS sound unavailable: " + failure.getMessage());
+            error("DS sound unavailable: " + failure.getMessage(), token);
             running.set(false);
+            sessionOwner.noteSaveFailure(hostToken, token);
         } finally {
             if (output != null) try { output.pause(); output.flush(); output.release(); }
             catch (IllegalStateException ignored) { }
@@ -452,13 +543,15 @@ public final class DsActivity extends Activity {
         if (left != null) left.releaseAll();
         if (right != null) right.releaseAll();
         if (coreReady) NativeDs.buttons(0);
-        if (!join(emulatorThread) || !join(audioThread)) {
+        boolean coreStopped = join(emulatorThread);
+        boolean audioStopped = join(audioThread);
+        if (!coreStopped || !audioStopped) {
             message("DS threads did not stop; save and core unload blocked");
             return false;
         }
         emulatorThread = audioThread = null;
         if (coreReady) NativeDs.clearAudio();
-        return save(true);
+        return save(true, 0);
     }
 
     private boolean join(Thread thread) {
@@ -471,7 +564,7 @@ public final class DsActivity extends Activity {
         return !thread.isAlive();
     }
 
-    private boolean save(boolean report) {
+    private boolean save(boolean report, long callbackRun) {
         if (!loaded || frames == 0 || gameId == null || saveStore == null) return true;
         try {
             int size = NativeDs.saveSize();
@@ -484,8 +577,16 @@ public final class DsActivity extends Activity {
             saveStore.write(gameId, data);
             return true;
         } catch (IOException failure) {
+            if (callbackRun != 0) sessionOwner.noteSaveFailure(hostToken, callbackRun);
             if (report) message("DS cartridge SRAM NOT saved: " + failure.getMessage());
-            else error("DS periodic cartridge save failed: " + failure.getMessage());
+            else {
+                String identity = gameId;
+                runOnUiThread(() -> {
+                    if (hostToken != null && sessionOwner.isCurrentHost(hostToken) &&
+                            identity != null && identity.equals(gameId))
+                        message("DS periodic cartridge save failed: " + failure.getMessage());
+                });
+            }
             return false;
         }
     }
@@ -493,21 +594,20 @@ public final class DsActivity extends Activity {
     @Override protected void onResume() {
         super.onResume();
         foreground = true;
-        if (loaded && !userPaused) start();
+        if (loaded && !userPaused && !sessionOwner.resume(hostToken))
+            message("DS resume blocked; prior stop, save or receipt is unresolved");
     }
 
     @Override protected void onPause() {
         foreground = false;
-        stopAndSave();
+        if (hostToken != null && !sessionOwner.pause(hostToken))
+            message("DS background pause unresolved; core switch and resume are blocked");
         super.onPause();
     }
 
     @Override protected void onDestroy() {
-        if (coreReady && stopAndSave()) {
-            NativeDs.unload();
-            NativeDs.shutdown();
-            coreReady = false;
-        }
+        if (hostToken != null && !sessionOwner.closeHost(hostToken))
+            android.util.Log.e("PlumpDS", "DS host close unresolved; retaining core ownership to prevent unsafe reuse");
         super.onDestroy();
     }
 }

@@ -9,14 +9,17 @@ import android.view.View;
 
 /** One-screen GBA touch controls. Pointer IDs are independent and always released on CANCEL. */
 final class ControlsView extends View {
+    interface Listener { void buttonsChanged(int mask); }
     private static final int B = 0, SELECT = 2, START = 3, UP = 4, DOWN = 5;
     private static final int LEFT = 6, RIGHT = 7, A = 8, L = 10, R = 11;
     private final ButtonInputState pointers = new ButtonInputState();
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Listener listener;
     private int mask;
 
-    ControlsView(Context context) {
+    ControlsView(Context context, Listener listener) {
         super(context);
+        this.listener = listener;
         setBackgroundColor(Color.rgb(28, 30, 34));
         setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_YES);
         setContentDescription("Virtual GBA D-pad, A, B, L, R, Start and Select");
@@ -62,7 +65,7 @@ final class ControlsView extends View {
         int next = pointers.mask();
         if (mask != next) {
             mask = next;
-            NativeCore.setButtons(next);
+            listener.buttonsChanged(next);
             invalidate();
         }
     }

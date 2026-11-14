@@ -101,6 +101,8 @@ bool environment(unsigned command, void* data) {
             struct Entry { const char* name; const char* value; };
             static constexpr Entry forced[] = {
                 {"melonds_network_mode", "disabled"},
+                {"melonds_homebrew_sdcard", "disabled"},
+                {"melonds_homebrew_sync_sdcard_to_host", "disabled"},
                 {"melonds_console_mode", "ds"},
                 {"melonds_boot_mode", "direct"},
                 {"melonds_sysfile_mode", "builtin"},

@@ -36,6 +36,8 @@ public final class MainActivity extends Activity {
     private static final int PICK_ROM = 42;
     private static final int MAX_ROM = 32 * 1024 * 1024;
     private final AtomicBoolean running = new AtomicBoolean(false);
+    private final EmulatorSessionOwner sessionOwner = EmulatorSessionOwner.process();
+    private EmulatorSessionOwner.HostToken hostToken;
     private TextView status;
     private Button pauseButton;
     private ControlsView controls;
@@ -48,8 +50,10 @@ public final class MainActivity extends Activity {
     private boolean nativeReady;
     private boolean coreInitialized;
     private boolean gameLoaded;
+    private boolean nativeGameLoaded;
     private boolean userPaused;
     private boolean activityResumed;
+    private volatile long runToken;
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
@@ -95,24 +99,23 @@ public final class MainActivity extends Activity {
         // Keep this View free of a background; the parent already supplies the
         // initial dark color before the first emulated frame arrives.
         root.addView(screen, new LinearLayout.LayoutParams(-1, -2));
-        controls = new ControlsView(this);
+        controls = new ControlsView(this, this::sendButtons);
         root.addView(controls, new LinearLayout.LayoutParams(-1, 0, 1f));
         setContentView(root);
 
-        if (NativeCore.LOAD_ERROR != null) {
-            message("Native core missing: " + NativeCore.LOAD_ERROR);
-            return;
-        }
-        String error = NativeCore.initialize();
-        if (error != null) { message("Cannot initialize mGBA: " + error); return; }
-        nativeReady = true;
-        coreInitialized = true;
         screen.getHolder().addCallback(new SurfaceHolder.Callback() {
-            @Override public void surfaceCreated(SurfaceHolder holder) { NativeCore.setSurface(holder.getSurface()); }
-            @Override public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
-                NativeCore.setSurface(holder.getSurface());
+            @Override public void surfaceCreated(SurfaceHolder holder) {
+                if (hostToken != null && sessionOwner.isCurrentHost(hostToken) && nativeReady)
+                    NativeCore.setSurface(holder.getSurface());
             }
-            @Override public void surfaceDestroyed(SurfaceHolder holder) { NativeCore.setSurface(null); }
+            @Override public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
+                if (hostToken != null && sessionOwner.isCurrentHost(hostToken) && nativeReady)
+                    NativeCore.setSurface(holder.getSurface());
+            }
+            @Override public void surfaceDestroyed(SurfaceHolder holder) {
+                if (hostToken != null && sessionOwner.isCurrentHost(hostToken) && nativeReady)
+                    NativeCore.setSurface(null);
+            }
         });
         try {
             saveStore = new GameSaveStore(new File(getFilesDir(), "native-saves"), directory -> {
@@ -130,13 +133,60 @@ public final class MainActivity extends Activity {
             });
         } catch (IOException exception) {
             message("Native-save storage unavailable: " + exception.getMessage());
-            nativeReady = false;
+            return;
         }
+        try {
+            hostToken = sessionOwner.attach(EmulatorSessionOwner.Console.GBA, new EmulatorSessionOwner.Host() {
+                @Override public boolean initializeCore() {
+                    if (NativeCore.LOAD_ERROR != null) {
+                        message("Native core missing: " + NativeCore.LOAD_ERROR);
+                        return false;
+                    }
+                    String error = NativeCore.initialize();
+                    if (error != null) { message("Cannot initialize mGBA: " + error); return false; }
+                    nativeReady = coreInitialized = true;
+                    return true;
+                }
+                @Override public boolean stopAndSave() { return stopLoopsAndSave(); }
+                @Override public boolean startLoops(long token) { return startOwnedLoops(token); }
+                @Override public void unloadGame() {
+                    if (nativeGameLoaded) NativeCore.unloadGame();
+                    nativeGameLoaded = gameLoaded = false;
+                    gameId = null;
+                    framesRun = 0;
+                }
+                @Override public void shutdownCore() {
+                    if (coreInitialized) NativeCore.shutdown();
+                    coreInitialized = nativeReady = false;
+                }
+            }, new SessionReceiptStore(new File(getFilesDir(), "session-receipts").toPath()));
+        } catch (IllegalStateException unavailable) {
+            message("GBA session still needs recovery; this Activity cannot reattach safely");
+            return;
+        }
+        if (!sessionOwner.initialize(hostToken)) {
+            message("GBA core initialization failed or a previous host is unresolved");
+            return;
+        }
+        if (screen.getHolder().getSurface().isValid())
+            NativeCore.setSurface(screen.getHolder().getSurface());
+        message("Select a GBA ROM. After Activity or process recreation, native SRAM is the fallback; exact-frame resume is unavailable.");
     }
 
     private int dp(int pixels) { return (int) (pixels * getResources().getDisplayMetrics().density + .5f); }
     private void message(String detail) { status.setText(detail); }
-    private void postError(String detail) { runOnUiThread(() -> message(detail)); }
+    private void postError(String detail, long callbackRun) {
+        runOnUiThread(() -> {
+            if (hostToken != null && sessionOwner.isCurrentHost(hostToken) && runToken == callbackRun)
+                message(detail);
+        });
+    }
+
+    private void sendButtons(int mask) {
+        if (nativeReady && hostToken != null && sessionOwner.isCurrentHost(hostToken) &&
+                (mask == 0 || sessionOwner.isCurrentRun(hostToken, runToken)))
+            NativeCore.setButtons(mask);
+    }
 
     private void openRom() {
         if (!nativeReady) { message("Core or save storage not available"); return; }
@@ -158,51 +208,66 @@ public final class MainActivity extends Activity {
             message("Could not read ROM: " + exception.getMessage());
             return;
         }
-        if (!stopLoopsAndSave()) { message("Previous core did not stop; ROM switch rejected"); return; }
-        if (gameLoaded) NativeCore.unloadGame();
-        gameLoaded = false;
-        gameId = null;
-        framesRun = 0;
-        String error = NativeCore.loadGame(rom);
-        if (error != null) { message("ROM rejected: " + error); return; }
         String identity = contentSha256(rom);
-        GameSaveStore.Recovery recovered = saveStore.load(identity);
-        if (recovered.bytes == null && recovered.warning != null) {
-            NativeCore.unloadGame();
-            message("Existing native save corrupt. Preserved for recovery; game not started.");
+        final GameSaveStore.Recovery[] recovery = new GameSaveStore.Recovery[1];
+        EmulatorSessionOwner.OpenResult opened = sessionOwner.open(hostToken, identity,
+                new EmulatorSessionOwner.GameLoader() {
+                    @Override public String loadAndRestore() {
+                        String error = NativeCore.loadGame(rom);
+                        if (error != null) return "ROM rejected: " + error;
+                        nativeGameLoaded = true;
+                        GameSaveStore.Recovery recovered = saveStore.load(identity);
+                        recovery[0] = recovered;
+                        if (recovered.bytes == null && recovered.warning != null)
+                            return "Existing native save corrupt. Preserved for recovery; game not started.";
+                        if (recovered.bytes != null) {
+                            String restoreError = NativeCore.restoreSaveRam(recovered.bytes);
+                            if (restoreError != null)
+                                return "Native save preserved; restore rejected: " + restoreError;
+                            // A successful JNI call alone does not establish that SRAM was
+                            // actually restored into the running core. Verify before any frames.
+                            byte[] readback = NativeCore.snapshotSaveRam();
+                            if (readback == null || !SaveRamSizeValidator.supportsRestore(
+                                    recovered.bytes.length, readback.length) ||
+                                    !MessageDigest.isEqual(recovered.bytes,
+                                            Arrays.copyOf(readback, recovered.bytes.length)))
+                                return "Native save preserved; SRAM restore readback mismatch.";
+                            android.util.Log.i("Plump", "Native SRAM restore readback VERIFIED: generation="
+                                    + recovered.generation + " bytes=" + recovered.bytes.length);
+                        }
+                        gameId = identity;
+                        framesRun = 0;
+                        gameLoaded = true;
+                        userPaused = false;
+                        return null;
+                    }
+
+                    @Override public void discardFailedLoad() {
+                        if (nativeGameLoaded) NativeCore.unloadGame();
+                        nativeGameLoaded = gameLoaded = false;
+                        gameId = null;
+                        framesRun = 0;
+                    }
+                });
+        if (!opened.opened) {
+            message("ROM was not opened: " + opened.error);
             return;
         }
-        if (recovered.bytes != null) {
-            String restoreError = NativeCore.restoreSaveRam(recovered.bytes);
-            if (restoreError != null) {
-                NativeCore.unloadGame();
-                message("Native save preserved; restore rejected: " + restoreError);
-                return;
-            }
-            // A successful JNI call alone does not establish that SRAM was
-            // actually restored into the running core. Verify the complete
-            // saved region before executing any new frames. Never discard or
-            // overwrite an existing save if verification fails.
-            byte[] readback = NativeCore.snapshotSaveRam();
-            if (readback == null || !SaveRamSizeValidator.supportsRestore(
-                    recovered.bytes.length, readback.length) ||
-                    !MessageDigest.isEqual(recovered.bytes,
-                            Arrays.copyOf(readback, recovered.bytes.length))) {
-                NativeCore.unloadGame();
-                message("Native save preserved; SRAM restore readback mismatch.");
-                return;
-            }
-            android.util.Log.i("Plump", "Native SRAM restore readback VERIFIED: generation="
-                    + recovered.generation + " bytes=" + recovered.bytes.length);
-        }
-        gameId = identity;
-        gameLoaded = true;
-        userPaused = false;
         pauseButton.setText("Pause");
-        message(recovered.warning == null ?
-                (recovered.bytes == null ? "GBA ready — game loaded" :
-                        "GBA ready — cartridge SRAM restored and verified") : recovered.warning);
-        if (activityResumed) startLoops();
+        GameSaveStore.Recovery recovered = recovery[0];
+        String ready = recovered == null || recovered.warning == null
+                ? (recovered == null || recovered.bytes == null ? "GBA ready — game loaded"
+                        : "GBA ready — cartridge SRAM restored and verified")
+                : recovered.warning;
+        if (opened.previousReceipt.corrupt)
+            ready += " — prior session receipt is corrupt; native SRAM only, no frame resume";
+        else if (opened.previousReceipt.state == SessionReceiptStore.State.RUNNING)
+            ready += " — last receipt says RUNNING; native SRAM only, no frame resume";
+        else
+            ready += " — reselect ROM after Activity or process recreation; exact-frame resume unavailable";
+        message(ready);
+        if (activityResumed && !sessionOwner.resume(hostToken))
+            message("GBA loaded, but run start is blocked by an unresolved session transition");
     }
 
     private byte[] readLocalRom(Uri uri) throws IOException {
@@ -234,22 +299,33 @@ public final class MainActivity extends Activity {
         if (!gameLoaded) { message("Choose a GBA ROM first"); return; }
         if (!userPaused) {
             userPaused = true;
-            if (stopLoopsAndSave()) message("Paused — cartridge save flushed");
             pauseButton.setText("Resume");
+            if (sessionOwner.pause(hostToken)) message("Paused — cartridge save and session receipt flushed");
+            else message("Pause is unresolved — save or receipt failed; switching and resume are blocked");
         } else {
+            if (!activityResumed) return;
             userPaused = false;
-            pauseButton.setText("Pause");
-            if (activityResumed) startLoops();
+            if (sessionOwner.resume(hostToken)) {
+                pauseButton.setText("Pause");
+            } else {
+                userPaused = true;
+                message("Resume blocked until the previous stop, save and receipt are resolved");
+            }
         }
     }
 
-    private void startLoops() {
-        if (!nativeReady || !gameLoaded || userPaused || !activityResumed || !running.compareAndSet(false, true)) return;
+    private boolean startOwnedLoops(long token) {
+        if (!nativeReady || !gameLoaded || userPaused || !activityResumed) return false;
+        if ((coreThread != null && coreThread.isAlive()) || (audioThread != null && audioThread.isAlive()))
+            return false;
+        if (!running.compareAndSet(false, true)) return false;
+        runToken = token;
+        try {
         coreThread = new Thread(() -> {
             long period = (long) (1_000_000_000.0 / NativeCore.frameRate());
             long next = System.nanoTime();
             long lastSave = SystemClock.elapsedRealtime();
-            while (running.get()) {
+            while (running.get() && sessionOwner.isCurrentRun(hostToken, token)) {
                 NativeCore.runFrame();
                 framesRun++;
                 long now = SystemClock.elapsedRealtime();
@@ -258,11 +334,11 @@ public final class MainActivity extends Activity {
                     String diagnostics = NativeCore.videoDiagnostics();
                     android.util.Log.i("Plump", "GBA video " + diagnostics);
                     runOnUiThread(() -> {
-                        if (gameLoaded && !userPaused) message("GBA " + diagnostics);
+                        if (sessionOwner.isCurrentRun(hostToken, token)) message("GBA " + diagnostics);
                     });
                 }
                 if (now - lastSave >= 30000) {
-                    flushNativeSave(false);
+                    flushNativeSave(false, token);
                     lastSave = now;
                 }
                 next += period;
@@ -272,11 +348,18 @@ public final class MainActivity extends Activity {
             }
         }, "Plump-emulation");
         coreThread.start();
-        audioThread = new Thread(this::pumpAudio, "Plump-audio");
+        audioThread = new Thread(() -> pumpAudio(token), "Plump-audio");
         audioThread.start();
+        return true;
+        } catch (RuntimeException failure) {
+            running.set(false);
+            joinThread(coreThread);
+            joinThread(audioThread);
+            return false;
+        }
     }
 
-    private void pumpAudio() {
+    private void pumpAudio(long token) {
         AudioTrack track = null;
         try {
             int rate = NativeCore.audioRate();
@@ -292,14 +375,14 @@ public final class MainActivity extends Activity {
                 throw new IllegalStateException("AudioTrack did not initialize");
             track.play();
             short[] chunk = new short[2048];
-            while (running.get()) {
+            while (running.get() && sessionOwner.isCurrentRun(hostToken, token)) {
                 int samples = NativeCore.drainAudio(chunk);
                 if (samples > 0) {
                     // WRITE_NON_BLOCKING prevents the UI pause/background path
                     // from waiting indefinitely for an audio device to drain.
                     // Partial writes must not silently discard the remaining PCM.
                     int offset = 0;
-                    while (running.get() && offset < samples) {
+                    while (running.get() && sessionOwner.isCurrentRun(hostToken, token) && offset < samples) {
                         int written = track.write(chunk, offset, samples - offset,
                                 AudioTrack.WRITE_NON_BLOCKING);
                         if (written < 0) throw new IllegalStateException("AudioTrack write error " + written);
@@ -311,8 +394,9 @@ public final class MainActivity extends Activity {
                 }
             }
         } catch (Exception exception) {
-            postError("Audio output unavailable: " + exception.getMessage());
+            postError("Audio output unavailable: " + exception.getMessage(), token);
             running.set(false);
+            sessionOwner.noteSaveFailure(hostToken, token);
         } finally {
             if (track != null) {
                 try { track.pause(); track.flush(); track.release(); } catch (IllegalStateException ignored) { }
@@ -324,13 +408,15 @@ public final class MainActivity extends Activity {
         running.set(false);
         if (controls != null && nativeReady) controls.releaseAll();
         if (nativeReady) NativeCore.setButtons(0);
-        if (!joinThread(coreThread) || !joinThread(audioThread)) {
+        boolean coreStopped = joinThread(coreThread);
+        boolean audioStopped = joinThread(audioThread);
+        if (!coreStopped || !audioStopped) {
             message("Core or audio still stopping — no save was attempted");
             return false;
         }
         coreThread = audioThread = null;
         if (coreInitialized) NativeCore.discardAudio();
-        return flushNativeSave(true);
+        return flushNativeSave(true, 0);
     }
 
     private boolean joinThread(Thread thread) {
@@ -343,7 +429,7 @@ public final class MainActivity extends Activity {
         return !thread.isAlive();
     }
 
-    private boolean flushNativeSave(boolean reportFailure) {
+    private boolean flushNativeSave(boolean reportFailure, long callbackRun) {
         if (!gameLoaded || framesRun == 0 || saveStore == null || gameId == null) return true;
         try {
             byte[] data = NativeCore.snapshotSaveRam();
@@ -351,8 +437,16 @@ public final class MainActivity extends Activity {
             saveStore.write(gameId, data);
             return true;
         } catch (IOException exception) {
+            if (callbackRun != 0) sessionOwner.noteSaveFailure(hostToken, callbackRun);
             if (reportFailure) message("Native save NOT written: " + exception.getMessage());
-            else postError("Periodic native save failed: " + exception.getMessage());
+            else {
+                String identity = gameId;
+                runOnUiThread(() -> {
+                    if (hostToken != null && sessionOwner.isCurrentHost(hostToken) &&
+                            identity != null && identity.equals(gameId))
+                        message("Periodic native save failed: " + exception.getMessage());
+                });
+            }
             return false;
         }
     }
@@ -360,21 +454,20 @@ public final class MainActivity extends Activity {
     @Override protected void onResume() {
         super.onResume();
         activityResumed = true;
-        if (gameLoaded && !userPaused) startLoops();
+        if (gameLoaded && !userPaused && !sessionOwner.resume(hostToken))
+            message("GBA resume blocked; previous stop, save or receipt is unresolved");
     }
 
     @Override protected void onPause() {
         activityResumed = false;
-        stopLoopsAndSave();
+        if (hostToken != null && !sessionOwner.pause(hostToken))
+            message("GBA background pause unresolved; core switch and resume are blocked");
         super.onPause();
     }
 
     @Override protected void onDestroy() {
-        if (coreInitialized && stopLoopsAndSave()) {
-            NativeCore.unloadGame();
-            NativeCore.shutdown();
-            coreInitialized = false;
-        }
+        if (hostToken != null && !sessionOwner.closeHost(hostToken))
+            android.util.Log.e("Plump", "GBA host close unresolved; retaining core ownership to prevent unsafe reuse");
         super.onDestroy();
     }
 }
