@@ -151,6 +151,53 @@ public final class EmulatorSessionOwnerTest {
         assertTrue(owner.isCurrentRun(dsToken, ds.lastRunToken));
     }
 
+    @Test public void multipleDsRomReloadsAndGbaReturnNeverDuplicateOwnedWorkers() throws Exception {
+        Path root = temporary.newFolder().toPath();
+        EmulatorSessionOwner owner = new EmulatorSessionOwner();
+        FakeHost gba = new FakeHost();
+        FakeHost ds = new FakeHost();
+        EmulatorSessionOwner.HostToken gbaToken = attach(owner, root, EmulatorSessionOwner.Console.GBA, gba);
+        EmulatorSessionOwner.HostToken dsToken = attach(owner, root, EmulatorSessionOwner.Console.DS, ds);
+        assertTrue(owner.initialize(gbaToken));
+        assertTrue(owner.initialize(dsToken));
+
+        assertTrue(open(owner, gbaToken, GAME_A).opened);
+        assertTrue(owner.resume(gbaToken));
+        assertTrue(owner.pause(gbaToken));
+        assertTrue(open(owner, dsToken, GAME_A).opened);
+        assertTrue(owner.resume(dsToken));
+        long firstDsRun = ds.lastRunToken;
+
+        assertTrue(open(owner, dsToken, GAME_B).opened);
+        assertEquals(1, ds.unloads.get());
+        assertEquals(SessionReceiptStore.State.CLOSED,
+                owner.readReceipt(EmulatorSessionOwner.Console.DS, GAME_A).state);
+        assertFalse(owner.isCurrentRun(dsToken, firstDsRun));
+        assertTrue(owner.resume(dsToken));
+        assertTrue(owner.pause(dsToken));
+        assertTrue(owner.resume(gbaToken));
+        assertFalse(owner.resume(dsToken));
+        assertEquals(0, ds.activeWorkers.get());
+        assertEquals(1, gba.activeWorkers.get());
+        assertTrue(owner.pause(gbaToken));
+
+        assertTrue(open(owner, dsToken, GAME_A).opened);
+        assertEquals(2, ds.unloads.get());
+        assertEquals(SessionReceiptStore.State.CLOSED,
+                owner.readReceipt(EmulatorSessionOwner.Console.DS, GAME_B).state);
+        assertTrue(owner.resume(dsToken));
+        assertEquals(1, ds.activeWorkers.get());
+        assertEquals(0, gba.activeWorkers.get());
+        assertEquals(3, ds.starts.get());
+        assertEquals(2, gba.starts.get());
+        assertEquals(1, ds.initializations.get());
+        assertEquals(1, gba.initializations.get());
+        assertTrue(ds.successfulSaves.get() >= 2);
+        assertTrue(owner.isCurrentRun(dsToken, ds.lastRunToken));
+        assertEquals(SessionReceiptStore.State.RUNNING,
+                owner.readReceipt(EmulatorSessionOwner.Console.DS, GAME_A).state);
+    }
+
     @Test public void switchIsOrderedAndOldReceiptClosesBeforeNewSessionReceipt() throws Exception {
         Path root = temporary.newFolder().toPath();
         EmulatorSessionOwner owner = new EmulatorSessionOwner();

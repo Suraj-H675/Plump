@@ -53,6 +53,11 @@ ANativeWindow* lowerWindow = nullptr;
 std::string systemDir, saveDir;
 std::vector<uint8_t> rom;
 bool loaded = false;
+// This pinned melonDS revision retains renderer configuration after unloading
+// its Console. Loading another ROM into that core dereferences the null Console
+// in UpdateRenderer. A load attempt (even a rejected one) requires a fresh
+// retro_deinit -> callback registration -> retro_init before the next load.
+bool needsCoreReset = false;
 std::atomic<uint32_t> buttonMask{0};
 std::atomic<uint64_t> touchState{0};
 std::atomic<uint64_t> videoFrames{0}, postedFrames{0}, rejectedFrames{0};
@@ -189,6 +194,26 @@ int16_t input(unsigned port, unsigned device, unsigned index, unsigned id) {
     return 0;
 }
 
+void registerCallbacks() {
+    api.setEnvironment(environment);
+    api.setVideo(video);
+    api.setAudio(audioSample);
+    api.setAudioBatch(audioBatch);
+    api.setPoll(inputPoll);
+    api.setInput(input);
+}
+
+// Called only under coreMutex with no running emulator/audio workers. Keep the
+// core loaded in the same dynamic library; retro_deinit reconstructs the
+// internal state, and the pinned core discards callbacks during deinit.
+void resetBeforeNextLoad() {
+    if (!needsCoreReset) return;
+    api.deinit();
+    registerCallbacks();
+    api.init();
+    needsCoreReset = false;
+}
+
 template <typename Function>
 bool symbol(Function& output, const char* name) {
     output = reinterpret_cast<Function>(dlsym(api.handle, name));
@@ -224,8 +249,12 @@ Java_dev_plump_emulator_NativeDs_initialize(JNIEnv* env, jclass, jstring system,
     if (api.handle) return problem(env, "DS core is already initialized");
     if (!system || !save) return problem(env, "Private DS storage unavailable");
     const char* sys = env->GetStringUTFChars(system, nullptr);
+    if (!sys) return nullptr; // JNI has a pending allocation exception.
     const char* sav = env->GetStringUTFChars(save, nullptr);
-    if (!sys || !sav) return problem(env, "Cannot access private DS paths");
+    if (!sav) {
+        env->ReleaseStringUTFChars(system, sys);
+        return nullptr;
+    }
     systemDir.assign(sys);
     saveDir.assign(sav);
     env->ReleaseStringUTFChars(system, sys);
@@ -247,13 +276,9 @@ Java_dev_plump_emulator_NativeDs_initialize(JNIEnv* env, jclass, jstring system,
         symbol(api.memoryData, "retro_get_memory_data") &&
         symbol(api.memorySize, "retro_get_memory_size");
     if (!okay) { dlclose(api.handle); api = {}; return problem(env, "Missing melonDS Libretro symbol"); }
-    api.setEnvironment(environment);
-    api.setVideo(video);
-    api.setAudio(audioSample);
-    api.setAudioBatch(audioBatch);
-    api.setPoll(inputPoll);
-    api.setInput(input);
+    registerCallbacks();
     api.init();
+    needsCoreReset = false;
     return nullptr;
 }
 
@@ -267,8 +292,16 @@ Java_dev_plump_emulator_NativeDs_load(JNIEnv* env, jclass, jbyteArray bytes) {
     rom.resize(size);
     env->GetByteArrayRegion(bytes, 0, size, reinterpret_cast<jbyte*>(rom.data()));
     if (env->ExceptionCheck()) { rom.clear(); return problem(env, "Could not read DS ROM"); }
+    // Reset *after* validating/copying input so an invalid picker result does
+    // not needlessly cycle the core. Do not reuse the prior renderer state.
+    resetBeforeNextLoad();
     const GameInfo content{"plump-local.nds", rom.data(), rom.size(), nullptr};
-    if (!api.load(&content)) { rom.clear(); return problem(env, "melonDS rejected DS ROM"); }
+    needsCoreReset = true; // A failed load may also leave partial core state.
+    if (!api.load(&content)) {
+        api.unload(); // Clean up any partially loaded core tasks/console.
+        unload();
+        return problem(env, "melonDS rejected DS ROM");
+    }
     loaded = true;
     AvInfo av{};
     api.avInfo(&av);
@@ -369,7 +402,13 @@ Java_dev_plump_emulator_NativeDs_unload(JNIEnv*, jclass) {
 extern "C" JNIEXPORT void JNICALL
 Java_dev_plump_emulator_NativeDs_shutdown(JNIEnv*, jclass) {
     std::lock_guard<std::mutex> lock(coreMutex);
-    if (api.handle) { unload(); api.deinit(); dlclose(api.handle); api = {}; }
+    if (api.handle) {
+        unload();
+        api.deinit();
+        dlclose(api.handle);
+        api = {};
+        needsCoreReset = false;
+    }
     std::lock_guard<std::mutex> surfaces(surfaceMutex);
     if (topWindow) { ANativeWindow_release(topWindow); topWindow = nullptr; }
     if (lowerWindow) { ANativeWindow_release(lowerWindow); lowerWindow = nullptr; }
