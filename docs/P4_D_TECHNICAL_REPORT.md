@@ -2,7 +2,7 @@
 
 **Date:** 2026-11-16
 **Baseline:** `main` at `00fa62ae398524e132424849492d2b32cbc789d8` (P4-C accepted at host level).
-**Verdict:** **D1 real-core host isolation PASS for GBA and DS; D2 durable branch storage and D3 narrow internal restoration implemented and host-tested; full P4-D remains PARTIAL** pending durable active-branch selection/recovery, on-device lifecycle proof, and D4 promotion. No APK installed, no phone access, no push, no general state-load controls, no core revision changes.
+**Verdict:** **D1 real-core host isolation PASS for GBA and DS; D2 durable branch selection/recovery and D3 narrow internal restoration have host closeout evidence; full P4-D remains PARTIAL** because Android-device lifecycle proof and D4 promotion are outside this closeout. The addendum at the end supersedes the earlier D2 pointer blocker and earlier verification counts. No APK installed, no phone access, no push, no general state-load controls, no core revision changes.
 
 ## Save ownership, audited boundaries
 
@@ -55,19 +55,19 @@ The `open(id, identity)` path verifies UUID, no-follow directories/files (includ
 
 Log: ignored `app/build/p4-d-review/process-hard-kill-publication.log`; **PASS 5/5**. Additional JVM `IOException` fault injections cover stage/pub boundaries, simulated zero free space, corruption, ROM/core mismatch, path traversal, symlinked journal/branch directories, incompatible native journal length and cold opening a progressed branch. **Actual physical disk exhaustion and Android power-loss were NOT tested.**
 
-**D2 remaining blocker:** there is **no durable active branch/canonical pointer** independently reconciled at process restart, no automatic branch cold reentry or validated branch selection/recovery workflow, and no complete branch retention policy. Existing canonical cold-load behavior is preserved rather than auto-selecting historical state. No older save is promoted or merged.
+**D2 remaining blocker at the time of the initial report:** the active branch/canonical pointer and process-restart reconciliation were not yet implemented. See the closeout addendum for the final host implementation and recovery evidence. A complete branch retention policy remains out of scope; no older save is promoted or merged.
 
 ## D3 — Internal exclusive restore, native-save routing, JNI
 
 `EmulatorSessionOwner.restoreHistoricalCheckpoint` requires an exclusively owned **paused canonical** session. It stops/quiesces workers, durably flushes canonical progress and publishes its paused receipt, verifies the checkpoint identity and **publishes the independent branch before changing emulator memory**. The Activity callback binds `activeSaveStore` to the branch PLSV journal *before* invoking any restoration, retires and freshly initializes the core, and loads only the branch pair. Both Activities route later periodic, pause, switching and shutdown save writes through that active journal. The DS core is reinitialized with branch-only `system/` and `core-data/`. Canonical-tagged auto/manual checkpoint creation is prohibited on active branches.
 
-The new mGBA and DS JNI `restoreCheckpoint(machine,native)` enforce bounded **exact** serialized and native-save sizes, Libretro API v1 and capabilities under each core mutex. `retro_unserialize` may rewind the native-save buffer: code reacquires the current SRAM/EEPROM pointer *after* machine restoration, installs the selected `N_state` and verifies native readback. On any failed/partial restore the possibly contaminated core is retired **without saving**, a fresh cold canonical PLSV recovery/readback is attempted, and the failed branch is quarantined; if canonical fallback also fails the session is retired/marked for recovery, not resumed. There is no general state-loading UI.
+The new mGBA and DS JNI `restoreCheckpoint(machine,native)` enforce bounded **exact** serialized and native-save sizes, Libretro API v1 and capabilities under each core mutex. `retro_unserialize` may rewind the native-save buffer: code reacquires the current SRAM/EEPROM pointer *after* machine restoration, installs the selected `N_state` and verifies native readback. In the original D3 experiment a canonical cold fallback was attempted after failure; the D2/D3 closeout **removed that unsafe automatic fallback**. The final implementation retires a possibly contaminated core without saving, marks ownership uncertain, and never automatically runs or flushes canonical on failed historical restoration. There is no general state-loading UI.
 
 **GBA real-core size hazard and fix:** immediately after `retro_load_game`, mGBA advertises provisional 128 KiB SRAM and a 528,448-byte state; after one isolated no-button frame it settles to 32 KiB SRAM and 430,144-byte checkpoint state. D3 primes **only the isolated branch core** with one frame before `retro_unserialize`. The genuine JNI regression verifies that premature restore rejects and primed restore succeeds with matching SRAM, then advances five real frames. Neither engine revision nor P4-C serialization format was modified.
 
 Real pinned JNI/owner/store host test `bash scripts/test-p4-c-checkpoints.sh` **PASS** after extending mGBA and melonDS host harnesses with genuine `restoreCheckpoint`, both native/machine byte-readback and rejection of wrong machine/native lengths; all existing GBA keys/audio, DS stylus/audio, original EEPROM rollback, unsupported/mutating/oversized capture and cold native-save regressions also pass. Log `app/build/p4-d-review/p4c-full-fresh-jni.log`. JVM owner/storage tests validate paused exclusivity, suppression of canonical-tagged checkpoints on a branch, bad recovery, atomic publication and identity checks.
 
-**D3 remains host-only and partial:** there is no verified real Android lifecycle/process-death historical restore, no process-resumable active branch pointer and chooser, no user-facing load controls, no real Android branch fsync/performance/power-loss proof. **D4 explicit branch promotion transaction is NOT IMPLEMENTED.** No implicit canonical replacement can occur via a promotion API.
+**D3 remains host-only:** process-resumable branch ownership was added and tested in the later closeout addendum. Android-device lifecycle, physical process-death during historical restore, real Android branch fsync/performance/power-loss proof, and public recovery controls remain unverified or unimplemented. **D4 explicit branch promotion transaction is NOT IMPLEMENTED.** No implicit canonical replacement can occur via a promotion API.
 
 ## Full independent verification
 
@@ -87,7 +87,7 @@ Initial source compilation errors (unretained GBA SurfaceView, C++ `const` reass
 
 - **Immutable checkpoint read:** `app/src/main/java/dev/plump/emulator/CheckpointStore.java` adds `readPair`, verified no-follow readback; no manifest/schema changes.
 - **Separate branch owner:** new `app/src/main/java/dev/plump/emulator/HistoricalBranchStore.java`; immutable pair + checked manifest, private PLSV journals, isolated DS core/system paths, atomic staging/publication, quarantine and strict open validation.
-- **Exclusive internal restore:** `app/src/main/java/dev/plump/emulator/EmulatorSessionOwner.java`, `MainActivity.java`, `DsActivity.java` add paused-only transition, branch-first save routing, fresh core restore/fail-closed fallback, no public load UI.
+- **Exclusive internal restore:** `app/src/main/java/dev/plump/emulator/EmulatorSessionOwner.java`, `MainActivity.java`, `DsActivity.java` add paused-only transition, branch-first save routing, fresh core restore/fail-closed retirement, no public load UI.
 - **Native adapters:** `app/src/main/java/dev/plump/emulator/{NativeCore,NativeDs}.java` and `app/src/main/cpp/{plump_host,nds_host}.cpp` add exact-size guarded machine/native `retro_unserialize` and readback, retaining pinned core revisions.
 - **Java regressions:** new `app/src/test/java/dev/plump/emulator/HistoricalBranchStoreTest.java` and extended `EmulatorSessionOwnerTest.java`.
 - **Real pinned JNI regressions:** extended `tests/native/mgba_checkpoint_test.cpp`, `tests/native/nds_host_lifecycle_test.cpp`; original P4-C entry scripts `scripts/test-p4-c-checkpoints.sh`, `scripts/test-p4-br-ds-reload.sh` now compile all required Java source types.
@@ -99,14 +99,91 @@ No PLSV native-save on-disk format, historical P4-C checkpoint format, session r
 
 ## Mastermind gate and acceptance recommendation
 
-**D1: ACCEPT CANDIDATE** — independently proven real mGBA/DS historical continuation with repeated branch native writes, separate-process cold recovery and byte-identical newer canonical journals.
+**D1: ACCEPTED by mastermind** — independently proven real mGBA/DS historical continuation with repeated branch native writes, separate-process cold recovery and byte-identical newer canonical journals.
 
-**D2: PARTIAL HOST IMPLEMENTATION** — source/branch pairing, exact identity, atomic private branch journals, interrupted publication and corruption fail-closed testing pass; no durable active branch pointer/selector, full retention or real disk-full/power-failure tests.
+**D2: PARTIAL IN ORIGINAL HOST IMPLEMENTATION** — source/branch pairing, exact identity, atomic private branch journals, interrupted publication and corruption fail-closed testing passed. The following closeout addendum addresses the former missing active selector; full retention and real disk-full/power-failure tests remain outside host evidence.
 
-**D3: PARTIAL HOST IMPLEMENTATION** — internal paused-owner code, separate save paths, genuine mGBA/DS JNI restore and rejection tests compile and pass. Android-device gameplay, lifecycle, hard-kill mid-restore, and process-restored branch selection are unverified; do not expose publicly.
+**D3: PARTIAL IN ORIGINAL HOST IMPLEMENTATION** — internal paused-owner code, separate save paths, genuine mGBA/DS JNI restore and rejection tests passed. Process-restored branch selection is now host-verified in the closeout addendum; on-device gameplay, lifecycle and actual Android process-death restore remain unverified. Do not expose publicly.
 
 **D4: NOT IMPLEMENTED** — no implicit promotion; explicit confirmed promotion, durable rollback copy, and idempotent crash-recovery gates require separate scope and proof.
 
-**P4-D overall: PARTIAL — not accepted as a complete restoration milestone.** The exact primary invariant was demonstrated for two host cores, but production history-selection/recovery is unfinished. Submit this evidence for mastermind review and stop; no P4-E/F, phone install, ADB, remote push, or personal save interaction.
+**P4-D overall: PARTIAL — not accepted as a complete restoration milestone.** The exact primary invariant and the later host-only selection/recovery closeout have evidence, but Android-device lifecycle and D4 promotion remain unverified or unimplemented. Submit for mastermind review and stop; no P4-E/F, phone install, ADB, remote push, or personal save interaction.
 
-Git baseline before commit: `00fa62ae398524e132424849492d2b32cbc789d8` on `main`; the final local repair commit/HEAD and preserved unrelated tree status must be reported separately after staging audit (a commit cannot contain its own hash).
+## D2/D3 host closeout addendum — 2026-11-16
+
+This addendum supersedes the earlier D2 pointer blocker and the earlier test count. The closeout began on canonical `main` at `fe01a72654df6dcd5c4611013f5d7caf5a9f9dcd`; no branch/worktree, remote push, device access or personal save access was used. The coherent local commit is recorded separately after the final staged audit. D1 remains independently accepted. D4 remains unimplemented.
+
+### Durable active timeline selector
+
+New `ActiveTimelineStore` keeps one selector per console+ROM in `active-timelines/`, separate from canonical and branch PLSV stores. It maintains two checksummed generations; each publication writes and fsyncs a same-directory temporary file, atomically renames it, fsyncs the directory, and validates the bytes by readback. A record pins ROM/core/frontend revisions, core binary SHA-256, ABI and serializer API. It identifies `CANONICAL` or a branch UUID and immutable source checkpoint UUID, and records the actual latest native PLSV generation and SHA-256. Coherent checkpoint fields are present only while the latest branch native generation still equals the immutable source `N_state`.
+
+Branch selection publishes `PREPARED` before core reinitialization and commits `COMMITTED` only after the internal restore callback succeeds and the target PLSV generation/hash is revalidated. Interrupted selection remains `PREPARED`/`AMBIGUOUS` and is never treated as canonical. After a native PLSV write, Activities verify that the current selector owns the destination, publish the durable PLSV generation/hash to the selector, and verify readback. A failed pointer update blocks subsequent saves and loads that selected target as invalid/ambiguous; it cannot route a later branch flush into canonical storage.
+
+For pre-selector v1 games, a valid canonical PLSV can initialize the canonical selector only if branch scanning proves there is no branch for that ROM. A valid same-ROM branch with no selector, an unreadable branch scan, an unreadable/corrupt selector, an unsafe/symlinked path, a wrong ROM/core/ABI identity, or a selector-to-PLSV generation/hash mismatch requires an explicit internal recovery choice. Valid unrelated-ROM branches do not block legacy initialization. Normal selection refuses corrupt-present selector metadata. Explicit `recoverCanonical`/`recoverBranch` first preserves selector bytes intact under `recovery-evidence/`; receipts do not select a timeline. Missing ROM availability leaves selection untouched and requires reselection. No automatic orphan cleanup or GC was added.
+
+An intact branch at its original native generation can be classified `POTENTIAL_EXACT_STATE`, but cold opening in either Activity always reinitializes the core and loads only the selector-verified latest native PLSV. It never auto-calls machine `retro_unserialize`; this prevents combining original `S_state` with a progressed `N_branch` and avoids a repeated cold-restore crash loop. Once `N_branch` advances, it is classified `BRANCH_NATIVE_ONLY`, and reselection retains the immutable original pair without claiming that it is coherent with the newer journal. Exact state+native restoration remains limited to the initial explicit in-session internal restore, whose new branch starts with the verified pair. This matches the current P4-C rule that branch checkpoint capture is forbidden.
+
+### Fresh-JVM crash interruption matrix
+
+`bash scripts/test-p4-d-branch-publication.sh` passed the existing 5/5 separate-JVM branch publication hard exits and the new 10/10 active-selector cases. Every crash process exited with `Runtime.halt(87)`; an independent JVM checked recovery classification, all three canonical PLSV files, and the immutable source checkpoint.
+
+| Hard-kill boundary | Fresh-JVM result | Evidence preserved |
+|---|---|---|
+| Before branch selection | `CANONICAL` | Canonical PLSV and source checkpoint |
+| After branch publication | `CANONICAL` | Canonical PLSV and complete orphan branch |
+| After selector `PREPARED` | `AMBIGUOUS` | Both histories and source checkpoint |
+| Before core init | `AMBIGUOUS` | Both histories and source checkpoint |
+| After core init | `AMBIGUOUS` | Both histories and source checkpoint |
+| After native restore | `AMBIGUOUS` | Both histories and source checkpoint |
+| After machine restore | `AMBIGUOUS` | Both histories and source checkpoint |
+| Before resumable `COMMITTED` | `AMBIGUOUS` | Both histories and source checkpoint |
+| After resumable `COMMITTED` | `POTENTIAL_EXACT_STATE`; cold path remains native-only | Both histories and source checkpoint |
+| During next branch journal temporary-record write | `POTENTIAL_EXACT_STATE`; incomplete newer PLSV generation ignored | Prior complete branch generation, canonical PLSV and source checkpoint |
+
+The selector probe's `AFTER_CORE_INIT`, `AFTER_NATIVE_RESTORE`, and `AFTER_MACHINE_RESTORE` names are host transaction barriers: that probe independently reopens and verifies branch storage/pair data at those points, but it does **not** execute or kill inside a native core call. Genuine JNI machine/native restoration is covered separately by the P4-C host regression. Real native-core process restart and continued writes are covered by the D1 harness below. No Android process-death or physical power-loss test is claimed. Evidence: ignored `app/build/p4-d-closeout/timeline-hardkill-final.log`.
+
+### Independent actual pinned-core restoration process deaths — 8/8 PASS
+
+Beyond the ten **transaction-boundary** kills, independent review added a reproducible genuine Libretro-core process-death harness: `scripts/test-p4-d-real-restore-deaths.sh`, `tests/host/RealCoreDeathProbe.java` and `tests/roms/verify-p4-d-real-restore-death.py`. Supply `PLUMP_P4_D_D1_SOURCE` pointing to the ignored test directory produced by the accepted D1 script (for this verification: `app/build/p4-d-d1-aNTyFn0z`). Each new disposable scenario seeds the canonical two PLSV generations and history receipt from the **genuine newer native save**, publishes an immutable real-core `S_state + N_state`, and leaves the selector durably `PREPARED`. A fresh Python process loads the **actual pinned mGBA or melonDS Libretro engine**, reaches the specified boundary and calls `os._exit(87)`; a fresh JVM independently verifies `AMBIGUOUS`, both source blobs, branch journal, and SHA-256 of **all three canonical PLSV files**.
+
+| Actual pinned core process killed at | GBA mGBA | DS melonDS | Independent cold classification |
+|---|---|---|---|
+| After genuine core initialization / ROM load | PASS | PASS | `AMBIGUOUS` |
+| After genuine native SRAM/EEPROM restoration | PASS | PASS | `AMBIGUOUS` |
+| Immediately after actual `retro_unserialize` (before selected native recopy) | PASS | PASS | `AMBIGUOUS` |
+| After reacquiring and verifying selected native bytes | PASS | PASS | `AMBIGUOUS` |
+
+**Result: 8/8 real pinned-core abrupt terminations PASS.** Each scenario independently preserved newer canonical three-file content, valid original checkpoint and branch journal; no contaminated in-memory history was flushed to canonical. Ignored evidence: `app/build/p4-d-closeout/actual-core-deaths-final.log` and stage logs under `app/build/p4-d-actual-core-deaths-DYmKToGx/`. These are real **Linux Libretro** core execution boundaries, not the Java transaction-barrier simulations. Neither suite claims actual Android app-process kills or physical battery/power-loss tests.
+
+### Real-core process restart and resumed branch writes
+
+`bash scripts/test-p4-d-real-branch-isolation.sh` passed again. The harness now bridges the real pinned engines to `ActiveTimelineStore`, `HistoricalBranchStore` and `GameSaveStore`: setup, selector resolution and branch journal writes run as separate Java processes; mGBA and melonDS each start a fresh native-core process, consume only latest branch PLSV bytes, advance the original test game's input-driven save counter, and publish/re-resolve the new generation. Neither cold path supplies the original machine state. The complete canonical two-slot PLSV plus receipt checksums remained identical before/after.
+
+| Evidence | mGBA GBA | melonDS DS |
+|---|---|---|
+| Host core SHA-256 | `af229495b5cbbff309cfa49d50fbe7dbdce2e26aad1deb4f79e9bd7fa9e2ff7c` | `e8c5fd156e9d1fe9fa861cd93cc0ef25ddc7eecb0ccf65a6a6a8c4695e577616` |
+| Fixture ROM SHA-256 | `c0bd6d6e77f94edba1bd14eb215f2e35590a1e2ad5edfe3d1774c88d998fd2f5` | `6d863811a7831129b06a0aa07db5955553b69b0fc4748f1fa6e3506de45d4f70` |
+| Selected branch generation 2 SHA-256 | `2f7bedc09fd70db7bb9871e4899a9d1cbdfc9fcfd46dd825913005a61719fe97` | `ae6b8f25600d613d32cbb0d97fda8ca4898ef043f20551e85ab06878276f040b` |
+| Fresh-JVM recovered classification | `BRANCH_NATIVE_ONLY`, counter 2 | `BRANCH_NATIVE_ONLY`, counter 2 |
+| Genuine cold-core input and durable branch write | real `KEY_A`, counter 2→3; generation 3 SHA-256 `27d7a3e59112e54e3f4d18b02be633d41de2e3f2155bc153ae7249091ddb43f0` | real `KEY_A`, counter 2→3; generation 3 SHA-256 `6971dc0db44c79d131648dd9710e91a58994138a854fe3908820c7a5de694460` |
+| Canonical full-file SHA-256 before/after | `.0` `97a38a6d7c143eb610557102381bcd1fb2e97b3547397c0a077b8db0a09116d4`; `.1` `ebeeef4be54377cc8a518d26bcf31d5c8fd15447cfdc02d4475374356972c14d`; receipt `2b58c04dc4defd717e82e4c00aa10bbe5bf326eb0860e7bf2440355203e3157b` | `.0` `d796c5c52a31f8c93cb4db6faa83410d0d714211047e3d28e29a3c72702ff84e`; `.1` `ccfc83b662486c23ee252cad84d85a62efc6fe38c71cb1ac76d1889dc72fa6af`; receipt `1e3354b8c34f1badd5c44a0919d1ad7b498cca6042843f0af5f25adcbc591a43` |
+
+Evidence: ignored `app/build/p4-d-d1-VcNkIgU0/{gba,ds}-timeline_{setup,cold}.log` and `app/build/p4-d-closeout/real-core-pointer.log`. The original D1 canonical-vs-branch real-core checks also passed in the same run.
+
+### Final host verification and limits
+
+| Command | Result |
+|---|---|
+| Direct `javac --release 17` compilation of all app Java main/test sources, then JUnitCore across all 13 suites | **PASS, 98 tests**; `app/build/p4-d-closeout/junit-final.log` |
+| `bash scripts/test-p4-c-checkpoints.sh` | **PASS**; genuine pinned mGBA/melonDS JNI, owner, state/EEPROM rollback and existing host regressions; `app/build/p4-d-closeout/p4c-final.log` |
+| `bash scripts/test-p4-d-branch-publication.sh` | **PASS**, 5/5 branch-publication plus 10/10 selector hard-kill matrix; `app/build/p4-d-closeout/timeline-hardkill-final.log` |
+| `bash scripts/test-p4-d-real-branch-isolation.sh` | **PASS**, original D1 plus fresh-JVM persisted-selector cold recovery and real branch writes on both engines; `app/build/p4-d-closeout/real-core-pointer.log` and per-stage logs above |
+| `PLUMP_P4_D_D1_SOURCE=app/build/p4-d-d1-aNTyFn0z bash scripts/test-p4-d-real-restore-deaths.sh` (source path may be absolute) | **PASS 8/8**; actual pinned Linux mGBA+melonDS core process terminations and independent selector/canonical/source verification; `app/build/p4-d-closeout/actual-core-deaths-final.log` |
+| `python3 scripts/test-p4-c-packaged-core-identity.py --negative-test` | **PASS**, both existing APK variants contain the pinned packaged cores and altered mGBA binaries are rejected; `app/build/p4-d-closeout/packaged-core-final.log` |
+| Final independent `./gradlew --offline --no-daemon :app:testDebugUnitTest :app:assembleDebug :app:assembleRelease :app:lintDebug` | **PASS** in canonical development shell after final source fixes: **98/98 JVM tests**, 13 suites, zero failures/errors/skips; ARM64 debug and unsigned release assembled, Android lint **0 errors, 23 warnings**. Log: `app/build/p4-d-closeout/gradle-independent-final.log`. The separate Codex worker sandbox **could not run Gradle** due its restricted socket/file-lock permissions; that is not a failure of the independently successful canonical build. |
+
+The final **independent packaged-core negative check** ran after the successful rebuild, `app/build/p4-d-closeout/packaged-core-independent-final.log`. Last observed whole-APK SHA-256: debug `4787823ba0db3a64c934170b87bc38c18700f6b1a0ffbaf2fb92cfaee574e699`; unsigned release `2919a5e95f2752046ea74848fb6557ea94e792ca9508468848fa81da003da03f`. **Whole APK hashes are not stable across arbitrary rebuilds:** any future installation candidate requires separate freezing and verification. The actual packaged ARM64 runtime emulator ELF SHA-256 stayed mGBA `10353b6c5eb8ace7a7ed1205173554b597b9b76738a2363b69e1de12c40991b6`, melonDS `83e7b9389083576d70c05466911f4796a8099bc1b43f5d56381c493c0d950c30`; intentionally altered/unstripped unexpected binaries were rejected. No APK was installed or authorized for installation.
+
+**Closeout status:** D2 active selector/recovery and D3 internal restore integration have concrete host implementation and evidence; the requested closeout boundary remains **host-only**. No public chooser, generic load UI, D4 promotion, Android-device lifecycle validation, exact cold machine resume, PLSV v1 change, P4-C format change, core revision, SD/3DS, or P4-E/F work was added. When a selector is ambiguous or unsafe, the Activities refuse auto-load and require explicit internal recovery; there is intentionally no end-user recovery UI in this scope.
+
+Git **closeout** baseline before commit: `fe01a72654df6dcd5c4611013f5d7caf5a9f9dcd` on `main`. The final local commit SHA and preserved unrelated working-tree status are reported in the handoff after staging audit (a committed report cannot contain its own commit hash).

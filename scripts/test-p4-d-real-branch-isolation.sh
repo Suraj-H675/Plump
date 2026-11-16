@@ -43,8 +43,12 @@ print('PASS disposable original GBA SRAM-counter ROM:', len(binary), 'bytes, SHA
 PY
 mkdir -p "$PLUMP_P4_D_JAVA_CLASSES"
 javac --release 17 -d "$PLUMP_P4_D_JAVA_CLASSES" \
+    "$root/app/src/main/java/dev/plump/emulator/CheckpointStore.java" \
     "$root/app/src/main/java/dev/plump/emulator/GameSaveStore.java" \
-    "$root/tests/host/JournalCli.java"
+    "$root/app/src/main/java/dev/plump/emulator/HistoricalBranchStore.java" \
+    "$root/app/src/main/java/dev/plump/emulator/ActiveTimelineStore.java" \
+    "$root/tests/host/JournalCli.java" \
+    "$root/tests/host/ActiveTimelineHostCli.java"
 export PYTHONDONTWRITEBYTECODE=1
 python3 -u "$root/tests/roms/verify-p4-d-gba-isolation.py"
 python3 -u "$root/tests/roms/verify-p4-d-ds-isolation.py"

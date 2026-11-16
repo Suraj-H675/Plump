@@ -17,6 +17,7 @@ javac --release 17 -d "$probe_classes" \
     "$root/app/src/main/java/dev/plump/emulator/CheckpointStore.java" \
     "$root/app/src/main/java/dev/plump/emulator/GameSaveStore.java" \
     "$root/app/src/main/java/dev/plump/emulator/HistoricalBranchStore.java" \
+    "$root/app/src/main/java/dev/plump/emulator/ActiveTimelineStore.java" \
     "$root/app/src/main/java/dev/plump/emulator/SessionReceiptStore.java" \
     "$root/app/src/main/java/dev/plump/emulator/EmulatorSessionOwner.java" \
     "$root/app/src/test/java/dev/plump/emulator/HostCheckpointProbe.java"

@@ -33,6 +33,10 @@ def journal(cmd, kind, datafile):
   folder=WORK / (kind+'-plsv')
   subprocess.run(['java','-cp',str(JAVACLASSES),'dev.plump.emulator.JournalCli',cmd,str(folder),SHA,str(datafile)],check=True)
 
+def active_timeline(operation,*extra):
+  subprocess.run(['java','-cp',str(JAVACLASSES),'dev.plump.emulator.ActiveTimelineHostCli',
+    operation,str(WORK),'ds',SHA,digest(CORE.read_bytes()),*[str(item) for item in extra]],check=True)
+
 def begin(label):
   root=WORK / ('host-'+label)
   root.mkdir(parents=True,exist_ok=False)
@@ -122,11 +126,45 @@ def cold(which):
     print('PASS DS D1 COLD',which,'in-game EEPROM counter',counter,'native SHA',digest(native),'canonical journal byte-identical',flush=True)
   finally:close(core)
 
+def timeline_setup():
+  active_timeline('setup',WORK/'s_old.bin',WORK/'n_state.bin',WORK/'n_branch.bin')
+  original=json.loads((WORK/'canonical-files.json').read_text())
+  assert files()==original,'Selector publication changed canonical PLSV'
+  print('PASS DS persisted active timeline seeded from real melonDS EEPROM checkpoint and progressed branch',flush=True)
+
+def timeline_cold():
+  original=json.loads((WORK/'canonical-files.json').read_text())
+  assert files()==original
+  active=WORK/'active-cold-native.bin'
+  active_timeline('resolve',active)
+  data=active.read_bytes()
+  assert data==(WORK/'n_branch.bin').read_bytes()
+  assert data[0x188]==2 and data[0x189]==0xfd
+  # A cold process reads only the selected latest branch PLSV generation.
+  core,rom_buffer,rom,render,audio,clock,refs=begin('timeline-cold')
+  try:
+    mem=core.retro_get_memory_data(0);assert mem and len(data)==core.retro_get_memory_size(0)
+    ct.memmove(mem,data,len(data))
+    for n in range(80):frame(core,clock,n)
+    assert sram(core)==data and sram(core)[0x188]==2
+    for n in range(80,150):frame(core,clock,n)
+    advanced=sram(core)
+    assert advanced[0x188]==3 and advanced[0x189]==0xfc,advanced[0x180:0x190].hex()
+    progressed=WORK/'n_branch_after_cold.bin';progressed.write_bytes(advanced)
+    active_timeline('write',progressed)
+    after=WORK/'active-after-write.bin';active_timeline('resolve',after)
+    assert after.read_bytes()==advanced
+    assert after.read_bytes()[0x188]==3 and after.read_bytes()[0x189]==0xfc
+    assert files()==original,'Canonical PLSV changed after resumed DS branch write'
+    print('PASS DS FRESH-PROCESS POINTER -> latest N_branch EEPROM counter=2 -> REAL melonDS KEY_A -> counter=3; canonical three-file SHA frozen',flush=True)
+  finally:close(core)
+
 if __name__=='__main__':
   if len(sys.argv)==2:
-    dict(first=first,branch=branch,canonical_cold=lambda:cold('canonical'),branch_cold=lambda:cold('branch'))[sys.argv[1]]()
+    dict(first=first,branch=branch,canonical_cold=lambda:cold('canonical'),branch_cold=lambda:cold('branch'),
+         timeline_setup=timeline_setup,timeline_cold=timeline_cold)[sys.argv[1]]()
   elif len(sys.argv)==1:
-    for stage in ('first','branch','canonical_cold','branch_cold'):
+    for stage in ('first','branch','canonical_cold','branch_cold','timeline_setup','timeline_cold'):
       log=WORK.parent/f'ds-{stage}.log'
       with log.open('w') as out:
         r=subprocess.run([sys.executable,str(Path(__file__).resolve()),stage],stdout=out,stderr=subprocess.STDOUT)

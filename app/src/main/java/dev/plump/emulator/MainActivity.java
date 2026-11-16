@@ -48,7 +48,9 @@ public final class MainActivity extends Activity {
     private GameSaveStore activeSaveStore;
     private CheckpointStore checkpointStore;
     private HistoricalBranchStore branchStore;
+    private ActiveTimelineStore timelineStore;
     private HistoricalBranchStore.Branch activeBranch;
+    private CheckpointStore.Identity activeIdentity;
     private byte[] activeRom;
     private String gameId;
     private volatile long framesRun;
@@ -154,6 +156,8 @@ public final class MainActivity extends Activity {
                     directory -> syncPath(directory),
                     path -> new android.os.StatFs(path.toString()).getAvailableBytes(),
                     directory -> syncSaveDirectory(directory), point -> { });
+            timelineStore = new ActiveTimelineStore(new File(getFilesDir(), "active-timelines").toPath(),
+                    directory -> syncPath(directory));
         } catch (IOException exception) {
             message("Native-save storage unavailable: " + exception.getMessage());
             return;
@@ -174,6 +178,7 @@ public final class MainActivity extends Activity {
                 @Override public boolean startLoops(long token) { return startOwnedLoops(token); }
                 @Override public CheckpointStore checkpointStore() { return checkpointStore; }
                 @Override public HistoricalBranchStore historicalBranchStore() { return branchStore; }
+                @Override public ActiveTimelineStore activeTimelineStore() { return timelineStore; }
                 @Override public EmulatorSessionOwner.RestoreDisposition restoreHistoricalBranch(
                         HistoricalBranchStore.Branch branch) { return restoreBranch(branch); }
                 @Override public CheckpointStore.Identity checkpointIdentity() {
@@ -209,6 +214,7 @@ public final class MainActivity extends Activity {
                     gameId = null;
                     activeRom = null;
                     activeBranch = null;
+                    activeIdentity = null;
                     activeSaveStore = saveStore;
                     framesRun = 0;
                 }
@@ -267,34 +273,43 @@ public final class MainActivity extends Activity {
         }
         String identity = contentSha256(rom);
         final GameSaveStore.Recovery[] recovery = new GameSaveStore.Recovery[1];
+        final ActiveTimelineStore.Resolution[] timeline = new ActiveTimelineStore.Resolution[1];
+        final CheckpointStore.Identity[] pinnedIdentity = new CheckpointStore.Identity[1];
         EmulatorSessionOwner.OpenResult opened = sessionOwner.open(hostToken, identity,
                 new EmulatorSessionOwner.GameLoader() {
                     @Override public String loadAndRestore() {
+                        try {
+                            pinnedIdentity[0] = PinnedCheckpointIdentity.gba(MainActivity.this, identity,
+                                    NativeCore.serializerApiVersion());
+                        } catch (IOException failure) {
+                            return "Pinned GBA identity is unavailable; saved histories were preserved";
+                        }
+                        timeline[0] = timelineStore.resolveCold(true, pinnedIdentity[0], saveStore, branchStore);
+                        if (!timeline[0].mayLoad())
+                            return "Timeline recovery requires an explicit internal choice: " + timeline[0].detail;
+                        activeIdentity = pinnedIdentity[0];
+                        activeBranch = timeline[0].branch;
+                        activeSaveStore = activeBranch == null ? saveStore : activeBranch.saves;
                         String error = NativeCore.loadGame(rom);
                         if (error != null) return "ROM rejected: " + error;
                         nativeGameLoaded = true;
-                        GameSaveStore.Recovery recovered = saveStore.load(identity);
-                        recovery[0] = recovered;
-                        if (recovered.bytes == null && recovered.warning != null)
-                            return "Existing native save corrupt. Preserved for recovery; game not started.";
-                        if (recovered.bytes != null) {
-                            String restoreError = NativeCore.restoreSaveRam(recovered.bytes);
+                        recovery[0] = new GameSaveStore.Recovery(timeline[0].nativeSave,
+                                timeline[0].detail, timeline[0].nativeGeneration,
+                                timeline[0].nativeSave == null ? GameSaveStore.Status.UNKNOWN : GameSaveStore.Status.AVAILABLE);
+                        if (timeline[0].nativeSave != null) {
+                            String restoreError = NativeCore.restoreSaveRam(timeline[0].nativeSave);
                             if (restoreError != null)
                                 return "Native save preserved; restore rejected: " + restoreError;
-                            // A successful JNI call alone does not establish that SRAM was
-                            // actually restored into the running core. Verify before any frames.
                             byte[] readback = NativeCore.snapshotSaveRam();
                             if (readback == null || !SaveRamSizeValidator.supportsRestore(
-                                    recovered.bytes.length, readback.length) ||
-                                    !MessageDigest.isEqual(recovered.bytes,
-                                            Arrays.copyOf(readback, recovered.bytes.length)))
+                                    timeline[0].nativeSave.length, readback.length) ||
+                                    !MessageDigest.isEqual(timeline[0].nativeSave,
+                                            Arrays.copyOf(readback, timeline[0].nativeSave.length)))
                                 return "Native save preserved; SRAM restore readback mismatch.";
                             android.util.Log.i("Plump", "Native SRAM restore readback VERIFIED: generation="
-                                    + recovered.generation + " bytes=" + recovered.bytes.length);
+                                    + timeline[0].nativeGeneration + " bytes=" + timeline[0].nativeSave.length);
                         }
                         activeRom = rom.clone();
-                        activeSaveStore = saveStore;
-                        activeBranch = null;
                         gameId = identity;
                         framesRun = 0;
                         gameLoaded = true;
@@ -308,8 +323,13 @@ public final class MainActivity extends Activity {
                         gameId = null;
                         activeRom = null;
                         activeBranch = null;
+                        activeIdentity = null;
                         activeSaveStore = saveStore;
                         framesRun = 0;
+                    }
+
+                    @Override public String selectedBranchId() {
+                        return timeline[0] == null || timeline[0].branch == null ? null : timeline[0].branch.id;
                     }
                 });
         if (!opened.opened) {
@@ -322,6 +342,10 @@ public final class MainActivity extends Activity {
                 ? (recovered == null || recovered.bytes == null ? "GBA ready — game loaded"
                         : "GBA ready — cartridge SRAM restored and verified")
                 : recovered.warning;
+        if (timeline[0].classification == ActiveTimelineStore.Classification.BRANCH_NATIVE_ONLY)
+            ready = "Historical branch native save restored and verified — exact machine resume unavailable";
+        else if (timeline[0].potentialExactStateAvailable())
+            ready = "Historical branch native save restored; a matching state exists but was not auto-loaded";
         if (opened.previousReceipt.corrupt)
             ready += " — prior session receipt is corrupt; native SRAM only, no frame resume";
         else if (opened.previousReceipt.state == SessionReceiptStore.State.RUNNING)
@@ -495,12 +519,25 @@ public final class MainActivity extends Activity {
     private boolean flushNativeSave(boolean reportFailure, long callbackRun) {
         GameSaveStore destination = activeSaveStore == null ? saveStore : activeSaveStore;
         if (!gameLoaded || framesRun == 0 || destination == null || gameId == null) return true;
+        boolean writeAttempted = false;
         try {
+            if (activeIdentity == null || timelineStore == null)
+                throw new IOException("Active timeline identity is unavailable; native write blocked");
+            String branchId = activeBranch == null ? null : activeBranch.id;
+            timelineStore.assertWritable(activeIdentity, branchId, destination);
             byte[] data = NativeCore.snapshotSaveRam();
             if (data == null) throw new IOException("No native SRAM available");
+            writeAttempted = true;
             destination.write(gameId, data);
+            ActiveTimelineStore.SelectionResult pointer = timelineStore.recordDurableSave(
+                    activeIdentity, branchId, destination, data);
+            if (!pointer.committed || pointer.nativeGeneration <= 0 ||
+                    !ActiveTimelineStore.sha256(data).equals(pointer.nativeSha256))
+                throw new IOException("Active timeline native generation failed post-write verification");
             return true;
         } catch (IOException exception) {
+            if (writeAttempted && activeIdentity != null && timelineStore != null)
+                timelineStore.markAmbiguous(activeIdentity);
             if (callbackRun != 0) sessionOwner.noteSaveFailure(hostToken, callbackRun);
             if (reportFailure) message("Native save NOT written: " + exception.getMessage());
             else {
@@ -545,41 +582,11 @@ public final class MainActivity extends Activity {
             userPaused = true;
             return EmulatorSessionOwner.RestoreDisposition.RESTORED_PAUSED;
         } catch (RuntimeException restoreFailure) {
-            android.util.Log.e("Plump", "Historical GBA restore failed; retiring the core before canonical fallback",
+            android.util.Log.e("Plump", "Historical GBA restore failed; retiring the core and preserving both timelines",
                     restoreFailure);
         }
-        try {
-            retireCoreWithoutSave();
-            activeBranch = null;
-            activeSaveStore = saveStore;
-            String error = NativeCore.initialize();
-            if (error != null) throw new IllegalStateException(error);
-            coreInitialized = nativeReady = true;
-            if (screenView != null && screenView.getHolder().getSurface().isValid())
-                NativeCore.setSurface(screenView.getHolder().getSurface());
-            error = NativeCore.loadGame(rom);
-            if (error != null) throw new IllegalStateException(error);
-            nativeGameLoaded = true;
-            GameSaveStore.Recovery canonical = saveStore.load(gameId);
-            if (canonical.bytes == null && canonical.warning != null)
-                throw new IllegalStateException("Canonical SRAM recovery is invalid");
-            if (canonical.bytes != null) {
-                error = NativeCore.restoreSaveRam(canonical.bytes);
-                byte[] readback = error == null ? NativeCore.snapshotSaveRam() : null;
-                if (error != null || readback == null ||
-                        !SaveRamSizeValidator.supportsRestore(canonical.bytes.length, readback.length) ||
-                        !MessageDigest.isEqual(canonical.bytes, Arrays.copyOf(readback, canonical.bytes.length)))
-                    throw new IllegalStateException("Canonical SRAM cold fallback readback failed");
-            }
-            gameLoaded = true;
-            framesRun = 0;
-            userPaused = true;
-            return EmulatorSessionOwner.RestoreDisposition.CANONICAL_FALLBACK_PAUSED;
-        } catch (RuntimeException fallbackFailure) {
-            android.util.Log.e("Plump", "Canonical GBA cold fallback failed", fallbackFailure);
-            try { retireCoreWithoutSave(); } catch (RuntimeException ignored) { }
-            return EmulatorSessionOwner.RestoreDisposition.FAILED;
-        }
+        try { retireCoreWithoutSave(); } catch (RuntimeException ignored) { }
+        return EmulatorSessionOwner.RestoreDisposition.FAILED;
     }
 
     private void retireCoreWithoutSave() {

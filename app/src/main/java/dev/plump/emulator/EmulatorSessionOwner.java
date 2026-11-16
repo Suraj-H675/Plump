@@ -17,6 +17,7 @@ final class EmulatorSessionOwner {
         void shutdownCore();
         default CheckpointStore checkpointStore() { return null; }
         default CheckpointStore.Identity checkpointIdentity() { return null; }
+        default ActiveTimelineStore activeTimelineStore() { return null; }
         default CheckpointStore.Capture captureCheckpoint() {
             return CheckpointStore.Capture.unsupported(0, "Checkpoint serializer unavailable");
         }
@@ -43,6 +44,8 @@ final class EmulatorSessionOwner {
     interface GameLoader {
         /** Loads a ROM and fully validates/restores its native save before returning null. */
         String loadAndRestore();
+        /** Branch identity selected by a validated cold recovery gate, if any. */
+        default String selectedBranchId() { return null; }
         /** Releases a partially loaded ROM after a failed load/restore. */
         void discardFailedLoad();
     }
@@ -227,6 +230,7 @@ final class EmulatorSessionOwner {
                 return new OpenResult(false, failure, prior);
             }
             Session session = new Session(token.console, gameId, Phase.PAUSED);
+            session.branchId = loader.selectedBranchId();
             synchronized (this) { sessions.put(token.console, session); }
             try {
                 publish(session, SessionReceiptStore.State.PAUSED);
@@ -430,17 +434,19 @@ final class EmulatorSessionOwner {
             HistoricalBranchStore branches;
             CheckpointStore checkpoints;
             CheckpointStore.Identity identity;
+            ActiveTimelineStore timelines;
             try {
                 branches = entry.host.historicalBranchStore();
                 checkpoints = entry.host.checkpointStore();
                 identity = entry.host.checkpointIdentity();
+                timelines = entry.host.activeTimelineStore();
             } catch (RuntimeException unavailable) {
                 synchronized (this) { if (exclusiveConsole == token.console) exclusiveConsole = null; }
                 return new RestoreResult(RestoreDisposition.FAILED, null,
                         "Pinned branch storage or identity is unavailable");
             }
             String expectedConsole = session.console == Console.GBA ? "gba" : "ds";
-            if (branches == null || checkpoints == null || identity == null ||
+            if (branches == null || checkpoints == null || timelines == null || identity == null ||
                     !expectedConsole.equals(identity.console) || !session.gameId.equals(identity.romSha256)) {
                 synchronized (this) { if (exclusiveConsole == token.console) exclusiveConsole = null; }
                 return new RestoreResult(RestoreDisposition.FAILED, null,
@@ -455,10 +461,26 @@ final class EmulatorSessionOwner {
                         failure.getMessage() == null ? "Historical branch creation failed" : failure.getMessage());
             }
 
+            ActiveTimelineStore.PendingSelection pending;
+            try { pending = timelines.prepareBranch(identity, branches, branch); }
+            catch (IOException | RuntimeException failure) {
+                timelines.markAmbiguous(identity);
+                markRecovery(session, true);
+                return new RestoreResult(RestoreDisposition.FAILED, branch.id,
+                        failure.getMessage() == null ? "Branch selection could not be prepared safely" : failure.getMessage());
+            }
+
             RestoreDisposition disposition;
             try { disposition = entry.host.restoreHistoricalBranch(branch); }
             catch (RuntimeException failure) { disposition = RestoreDisposition.FAILED; }
             if (disposition == RestoreDisposition.RESTORED_PAUSED) {
+                try { timelines.commit(pending); }
+                catch (IOException | RuntimeException failure) {
+                    timelines.markAmbiguous(identity);
+                    markRecovery(session, true);
+                    return new RestoreResult(RestoreDisposition.FAILED, branch.id,
+                            "Branch core restore completed, but durable selection is unresolved; both histories remain preserved");
+                }
                 synchronized (this) {
                     session.branchId = branch.id;
                     session.phase = Phase.PAUSED;
@@ -467,25 +489,10 @@ final class EmulatorSessionOwner {
                 return new RestoreResult(disposition, branch.id, null);
             }
 
-            String error = disposition == RestoreDisposition.CANONICAL_FALLBACK_PAUSED
-                    ? "Historical restore failed; canonical save was cold-restored"
-                    : "Historical restore and cold canonical fallback both failed; host retired";
-            boolean quarantined = true;
-            try { branches.quarantine(branch.id); }
-            catch (IOException quarantineFailure) {
-                quarantined = false;
-                error += "; branch quarantine failed: " + quarantineFailure.getMessage();
-            }
-            if (disposition == RestoreDisposition.CANONICAL_FALLBACK_PAUSED && quarantined) {
-                synchronized (this) {
-                    session.phase = Phase.PAUSED;
-                    if (exclusiveConsole == token.console) exclusiveConsole = null;
-                }
-            } else {
-                markRecovery(session, true);
-            }
-            return new RestoreResult(disposition == RestoreDisposition.CANONICAL_FALLBACK_PAUSED && quarantined
-                    ? disposition : RestoreDisposition.FAILED, branch.id, error);
+            timelines.markAmbiguous(identity);
+            markRecovery(session, true);
+            return new RestoreResult(RestoreDisposition.FAILED, branch.id,
+                    "Historical restore failed; core was retired and canonical plus branch histories remain preserved for explicit recovery");
         } finally {
             transitions.unlock();
         }

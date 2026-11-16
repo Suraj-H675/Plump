@@ -12,6 +12,7 @@ import java.nio.ByteBuffer;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.FileSystemException;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
@@ -155,6 +156,22 @@ public final class GameSaveStore {
         return new File(directory, gameId + ".history");
     }
 
+    /** Rejects paths that would make PLSV validation follow substituted or non-regular files. */
+    synchronized boolean hasUnsafePaths(String gameId) {
+        validateGameId(gameId);
+        Path root = directory.toPath();
+        if (Files.isSymbolicLink(root) ||
+                (Files.exists(root, LinkOption.NOFOLLOW_LINKS) &&
+                        !Files.isDirectory(root, LinkOption.NOFOLLOW_LINKS))) return true;
+        for (Path path : new Path[]{slot(gameId, 0).toPath(), slot(gameId, 1).toPath(),
+                historyReceipt(gameId).toPath()}) {
+            if (Files.isSymbolicLink(path)) return true;
+            if (Files.exists(path, LinkOption.NOFOLLOW_LINKS) &&
+                    !Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) return true;
+        }
+        return false;
+    }
+
     private static byte[] sha256(byte[] bytes) {
         try { return MessageDigest.getInstance("SHA-256").digest(bytes); }
         catch (NoSuchAlgorithmException exception) { throw new AssertionError(exception); }
@@ -250,6 +267,9 @@ public final class GameSaveStore {
 
     public synchronized void write(String gameId, byte[] bytes) throws IOException {
         validateGameId(gameId);
+        if (hasUnsafePaths(gameId))
+            throw new SaveFailure(FailureReason.RECOVERY_REQUIRED,
+                    "Native-save storage contains a symlink or non-regular path; refusing to write");
         if (bytes == null || bytes.length == 0 || bytes.length > MAX_LENGTH)
             throw new SaveFailure(FailureReason.INVALID_LENGTH, "Core returned invalid SRAM length");
 

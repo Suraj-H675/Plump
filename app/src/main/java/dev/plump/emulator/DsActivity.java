@@ -53,7 +53,9 @@ public final class DsActivity extends Activity {
     private GameSaveStore activeSaveStore;
     private CheckpointStore checkpointStore;
     private HistoricalBranchStore branchStore;
+    private ActiveTimelineStore timelineStore;
     private HistoricalBranchStore.Branch activeBranch;
+    private CheckpointStore.Identity activeIdentity;
     private byte[] activeRom;
     private File systemDirectory, canonicalCoreDirectory;
     private String gameId;
@@ -253,6 +255,8 @@ public final class DsActivity extends Activity {
                     directory -> syncPath(directory),
                     path -> new android.os.StatFs(path.toString()).getAvailableBytes(),
                     directory -> syncSaveDirectory(directory), point -> { });
+            timelineStore = new ActiveTimelineStore(new File(getFilesDir(), "active-timelines").toPath(),
+                    directory -> syncPath(directory));
             hostToken = sessionOwner.attach(EmulatorSessionOwner.Console.DS, new EmulatorSessionOwner.Host() {
                 @Override public boolean initializeCore() {
                     if (NativeDs.LOAD_ERROR != null) {
@@ -268,6 +272,7 @@ public final class DsActivity extends Activity {
                 @Override public boolean startLoops(long token) { return startOwnedLoops(token); }
                 @Override public CheckpointStore checkpointStore() { return checkpointStore; }
                 @Override public HistoricalBranchStore historicalBranchStore() { return branchStore; }
+                @Override public ActiveTimelineStore activeTimelineStore() { return timelineStore; }
                 @Override public EmulatorSessionOwner.RestoreDisposition restoreHistoricalBranch(
                         HistoricalBranchStore.Branch branch) { return restoreBranch(branch); }
                 @Override public CheckpointStore.Identity checkpointIdentity() {
@@ -303,6 +308,7 @@ public final class DsActivity extends Activity {
                     gameId = null;
                     activeRom = null;
                     activeBranch = null;
+                    activeIdentity = null;
                     activeSaveStore = saveStore;
                     frames = 0;
                 }
@@ -398,27 +404,41 @@ public final class DsActivity extends Activity {
         catch (IOException failure) { message("Cannot read DS file: " + failure.getMessage()); return; }
         String identity = identity(bytes);
         final GameSaveStore.Recovery[] recovery = new GameSaveStore.Recovery[1];
+        final ActiveTimelineStore.Resolution[] timeline = new ActiveTimelineStore.Resolution[1];
+        final CheckpointStore.Identity[] pinnedIdentity = new CheckpointStore.Identity[1];
         EmulatorSessionOwner.OpenResult opened = sessionOwner.open(hostToken, identity,
                 new EmulatorSessionOwner.GameLoader() {
                     @Override public String loadAndRestore() {
+                        try {
+                            pinnedIdentity[0] = PinnedCheckpointIdentity.ds(DsActivity.this, identity,
+                                    NativeDs.serializerApiVersion());
+                        } catch (IOException failure) {
+                            return "Pinned DS identity is unavailable; saved histories were preserved";
+                        }
+                        timeline[0] = timelineStore.resolveCold(true, pinnedIdentity[0], saveStore, branchStore);
+                        if (!timeline[0].mayLoad())
+                            return "Timeline recovery requires an explicit internal choice: " + timeline[0].detail;
+                        activeIdentity = pinnedIdentity[0];
+                        activeBranch = timeline[0].branch;
+                        activeSaveStore = activeBranch == null ? saveStore : activeBranch.saves;
+                        String initError = initializeForTimeline(activeBranch);
+                        if (initError != null) return "DS core could not open selected timeline storage: " + initError;
                         String issue = NativeDs.load(bytes);
                         if (issue != null) return "DS ROM rejected: " + issue;
                         nativeGameLoaded = true;
-                        GameSaveStore.Recovery prior = saveStore.load(identity);
-                        recovery[0] = prior;
-                        if (prior.warning != null && prior.bytes == null)
-                            return "Corrupt DS save preserved; refusing to start the cartridge";
-                        if (prior.bytes != null) {
-                            String restoreError = NativeDs.restore(prior.bytes);
+                        recovery[0] = new GameSaveStore.Recovery(timeline[0].nativeSave,
+                                timeline[0].detail, timeline[0].nativeGeneration,
+                                timeline[0].nativeSave == null ? GameSaveStore.Status.UNKNOWN : GameSaveStore.Status.AVAILABLE);
+                        if (timeline[0].nativeSave != null) {
+                            String restoreError = NativeDs.restore(timeline[0].nativeSave);
                             byte[] checked = restoreError == null ? NativeDs.snapshot() : null;
-                            if (restoreError != null || checked == null || !Arrays.equals(prior.bytes, checked))
+                            if (restoreError != null || checked == null || !Arrays.equals(timeline[0].nativeSave, checked))
                                 return "DS save preserved; core restore validation failed";
-                            android.util.Log.i("PlumpDS", "DS cartridge save restored and byte-verified: generation=" + prior.generation);
+                            android.util.Log.i("PlumpDS", "DS cartridge save restored and byte-verified: generation=" +
+                                    timeline[0].nativeGeneration);
                         }
                         loaded = true;
                         activeRom = bytes.clone();
-                        activeSaveStore = saveStore;
-                        activeBranch = null;
                         gameId = identity;
                         frames = 0;
                         userPaused = false;
@@ -431,8 +451,13 @@ public final class DsActivity extends Activity {
                         gameId = null;
                         activeRom = null;
                         activeBranch = null;
+                        activeIdentity = null;
                         activeSaveStore = saveStore;
                         frames = 0;
+                    }
+
+                    @Override public String selectedBranchId() {
+                        return timeline[0] == null || timeline[0].branch == null ? null : timeline[0].branch.id;
                     }
                 });
         if (!opened.opened) {
@@ -446,6 +471,10 @@ public final class DsActivity extends Activity {
                         NativeDs.saveSize() > 1024 * 1024 ?
                         "DS loaded — unsupported cartridge-save size; do not rely on saving" :
                         "DS loaded — native cartridge save active");
+        if (timeline[0].classification == ActiveTimelineStore.Classification.BRANCH_NATIVE_ONLY)
+            ready = "DS historical branch native save restored and verified — exact machine resume unavailable";
+        else if (timeline[0].potentialExactStateAvailable())
+            ready = "DS branch native save restored; a matching state exists but was not auto-loaded";
         if (opened.previousReceipt.corrupt)
             ready += " — prior session receipt is corrupt; no frame resume";
         else if (opened.previousReceipt.state == SessionReceiptStore.State.RUNNING)
@@ -631,7 +660,12 @@ public final class DsActivity extends Activity {
     private boolean save(boolean report, long callbackRun) {
         GameSaveStore destination = activeSaveStore == null ? saveStore : activeSaveStore;
         if (!loaded || frames == 0 || gameId == null || destination == null) return true;
+        boolean writeAttempted = false;
         try {
+            if (activeIdentity == null || timelineStore == null)
+                throw new IOException("Active timeline identity is unavailable; cartridge save blocked");
+            String branchId = activeBranch == null ? null : activeBranch.id;
+            timelineStore.assertWritable(activeIdentity, branchId, destination);
             int size = NativeDs.saveSize();
             if (size == 0) return true; // Homebrew virtual SD files are NOT cartridge SRAM.
             if (size < 0 || size > 1024 * 1024)
@@ -639,9 +673,17 @@ public final class DsActivity extends Activity {
             byte[] data = NativeDs.snapshot();
             if (data == null || data.length != size)
                 throw new IOException("DS cartridge SRAM returned no complete snapshot");
+            writeAttempted = true;
             destination.write(gameId, data);
+            ActiveTimelineStore.SelectionResult pointer = timelineStore.recordDurableSave(
+                    activeIdentity, branchId, destination, data);
+            if (!pointer.committed || pointer.nativeGeneration <= 0 ||
+                    !ActiveTimelineStore.sha256(data).equals(pointer.nativeSha256))
+                throw new IOException("Active timeline native generation failed post-write verification");
             return true;
         } catch (IOException failure) {
+            if (writeAttempted && activeIdentity != null && timelineStore != null)
+                timelineStore.markAmbiguous(activeIdentity);
             if (callbackRun != 0) sessionOwner.noteSaveFailure(hostToken, callbackRun);
             if (report) message("DS cartridge SRAM NOT saved: " + failure.getMessage());
             else {
@@ -678,38 +720,22 @@ public final class DsActivity extends Activity {
             userPaused = true;
             return EmulatorSessionOwner.RestoreDisposition.RESTORED_PAUSED;
         } catch (RuntimeException restoreFailure) {
-            android.util.Log.e("PlumpDS", "Historical DS restore failed; retiring the core before canonical fallback",
+            android.util.Log.e("PlumpDS", "Historical DS restore failed; retiring the core and preserving both timelines",
                     restoreFailure);
         }
-        try {
-            retireCoreWithoutSave();
-            activeBranch = null;
-            activeSaveStore = saveStore;
-            String issue = NativeDs.initialize(systemDirectory.getAbsolutePath(), canonicalCoreDirectory.getAbsolutePath());
-            if (issue != null) throw new IllegalStateException(issue);
-            coreReady = true;
-            reattachSurfaces();
-            issue = NativeDs.load(rom);
-            if (issue != null) throw new IllegalStateException(issue);
-            nativeGameLoaded = true;
-            GameSaveStore.Recovery canonical = saveStore.load(gameId);
-            if (canonical.warning != null && canonical.bytes == null)
-                throw new IllegalStateException("Canonical DS save recovery is invalid");
-            if (canonical.bytes != null) {
-                issue = NativeDs.restore(canonical.bytes);
-                byte[] readback = issue == null ? NativeDs.snapshot() : null;
-                if (issue != null || readback == null || !Arrays.equals(canonical.bytes, readback))
-                    throw new IllegalStateException("Canonical DS save cold fallback readback failed");
-            }
-            loaded = true;
-            frames = 0;
-            userPaused = true;
-            return EmulatorSessionOwner.RestoreDisposition.CANONICAL_FALLBACK_PAUSED;
-        } catch (RuntimeException fallbackFailure) {
-            android.util.Log.e("PlumpDS", "Canonical DS cold fallback failed", fallbackFailure);
-            try { retireCoreWithoutSave(); } catch (RuntimeException ignored) { }
-            return EmulatorSessionOwner.RestoreDisposition.FAILED;
-        }
+        try { retireCoreWithoutSave(); } catch (RuntimeException ignored) { }
+        return EmulatorSessionOwner.RestoreDisposition.FAILED;
+    }
+
+    private String initializeForTimeline(HistoricalBranchStore.Branch branch) {
+        retireCoreWithoutSave();
+        File system = branch == null ? systemDirectory : branch.systemDirectory.toFile();
+        File coreData = branch == null ? canonicalCoreDirectory : branch.coreDataDirectory.toFile();
+        String issue = NativeDs.initialize(system.getAbsolutePath(), coreData.getAbsolutePath());
+        if (issue != null) return issue;
+        coreReady = true;
+        reattachSurfaces();
+        return null;
     }
 
     private void reattachSurfaces() {

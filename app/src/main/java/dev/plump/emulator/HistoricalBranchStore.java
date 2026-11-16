@@ -30,6 +30,7 @@ final class HistoricalBranchStore {
     enum FaultPoint { BEFORE_STAGE, AFTER_MACHINE, AFTER_NATIVE, AFTER_JOURNAL,
         BEFORE_MANIFEST, AFTER_MANIFEST, AFTER_STAGE_FSYNC, BEFORE_PUBLISH,
         AFTER_PUBLISH, AFTER_READBACK, BEFORE_QUARANTINE }
+    enum Evidence { NONE, MATCHING_ROM, UNKNOWN }
     interface FaultInjector { void at(FaultPoint point) throws IOException; }
     interface DirectorySync { void sync(Path directory) throws IOException; }
     interface UsableSpace { long bytes(Path directory) throws IOException; }
@@ -170,6 +171,31 @@ final class HistoricalBranchStore {
             throw new IOException("Branch quarantine requires atomic directory rename", unsupported);
         }
         directorySync.sync(root);
+    }
+
+    /** Scans published/quarantined branch metadata for a missing-selector recovery decision. */
+    synchronized Evidence scanPublishedEvidence(CheckpointStore.Identity expected) {
+        if (expected == null) return Evidence.UNKNOWN;
+        if (!Files.exists(root, LinkOption.NOFOLLOW_LINKS)) return Evidence.NONE;
+        if (Files.isSymbolicLink(root) || !Files.isDirectory(root, LinkOption.NOFOLLOW_LINKS)) return Evidence.UNKNOWN;
+        boolean unknown = false;
+        try (DirectoryStream<Path> entries = Files.newDirectoryStream(root)) {
+            for (Path entry : entries) {
+                String name = entry.getFileName().toString();
+                if (!name.startsWith("branch-") && !name.startsWith("quarantine-")) continue;
+                if (Files.isSymbolicLink(entry) || !Files.isDirectory(entry, LinkOption.NOFOLLOW_LINKS)) {
+                    unknown = true;
+                    continue;
+                }
+                try {
+                    String[] fields = decode(readBounded(entry.resolve("manifest.hbr"), MANIFEST_LIMIT));
+                    if (expected.romSha256.equals(fields[5])) return Evidence.MATCHING_ROM;
+                } catch (IOException | RuntimeException unreadable) { unknown = true; }
+            }
+            return unknown ? Evidence.UNKNOWN : Evidence.NONE;
+        } catch (IOException failure) {
+            return Evidence.UNKNOWN;
+        }
     }
 
     private Branch openPublished(Path directory, String id, CheckpointStore.Identity expected) throws IOException {

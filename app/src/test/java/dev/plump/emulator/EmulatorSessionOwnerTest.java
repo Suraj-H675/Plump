@@ -393,6 +393,7 @@ public final class EmulatorSessionOwnerTest {
         host.checkpointCapture = CheckpointStore.Capture.supported(1, new byte[]{1, 2, 3}, new byte[]{4, 5});
         host.branchStore = new HistoricalBranchStore(root.resolve("branches"), ignored -> { },
                 ignored -> Long.MAX_VALUE, ignored -> { }, ignored -> { });
+        host.timelineStore = new ActiveTimelineStore(root.resolve("timelines"), ignored -> { });
         host.restoreDisposition = EmulatorSessionOwner.RestoreDisposition.RESTORED_PAUSED;
         CheckpointStore.Record historical = host.checkpointStore.create(host.checkpointIdentity,
                 host.checkpointCapture, CheckpointStore.Kind.MANUAL);
@@ -421,7 +422,7 @@ public final class EmulatorSessionOwnerTest {
                 .allMatch(record -> "canonical".equals(record.branchId)));
     }
 
-    @Test public void failedHistoricalRestoreQuarantinesBranchAfterCanonicalFallback() throws Exception {
+    @Test public void failedHistoricalRestoreRetiresCoreAndPreservesAmbiguousHistories() throws Exception {
         Path root = temporary.newFolder().toPath();
         EmulatorSessionOwner owner = new EmulatorSessionOwner();
         FakeHost host = new FakeHost();
@@ -430,6 +431,7 @@ public final class EmulatorSessionOwnerTest {
         host.checkpointCapture = CheckpointStore.Capture.supported(1, new byte[]{9, 8, 7}, new byte[]{6, 5});
         host.branchStore = new HistoricalBranchStore(root.resolve("branches"), ignored -> { },
                 ignored -> Long.MAX_VALUE, ignored -> { }, ignored -> { });
+        host.timelineStore = new ActiveTimelineStore(root.resolve("timelines"), ignored -> { });
         host.restoreDisposition = EmulatorSessionOwner.RestoreDisposition.CANONICAL_FALLBACK_PAUSED;
         CheckpointStore.Record historical = host.checkpointStore.create(host.checkpointIdentity,
                 host.checkpointCapture, CheckpointStore.Kind.MANUAL);
@@ -439,9 +441,13 @@ public final class EmulatorSessionOwnerTest {
         assertTrue(open(owner, token, GAME_A).opened);
 
         EmulatorSessionOwner.RestoreResult result = owner.restoreHistoricalCheckpoint(token, historical.id);
-        assertEquals(EmulatorSessionOwner.RestoreDisposition.CANONICAL_FALLBACK_PAUSED, result.disposition);
-        assertTrue(Files.isDirectory(root.resolve("branches").resolve("quarantine-" + result.branchId)));
-        assertTrue(owner.resume(token));
+        assertEquals(EmulatorSessionOwner.RestoreDisposition.FAILED, result.disposition);
+        assertFalse(Files.exists(root.resolve("branches").resolve("quarantine-" + result.branchId)));
+        assertFalse(owner.resume(token));
+        assertEquals(ActiveTimelineStore.Classification.AMBIGUOUS,
+                host.timelineStore.resolveCold(true, host.checkpointIdentity,
+                        new GameSaveStore(root.resolve("canonical").toFile(), ignored -> { }),
+                        host.branchStore).classification);
     }
 
     @Test public void exclusiveOwnerLockPreventsCloseDuringPausedCapture() throws Exception {
@@ -613,6 +619,7 @@ public final class EmulatorSessionOwnerTest {
         volatile CountDownLatch allowCapture;
         volatile String checkpointFailure;
         volatile HistoricalBranchStore branchStore;
+        volatile ActiveTimelineStore timelineStore;
         volatile EmulatorSessionOwner.RestoreDisposition restoreDisposition =
                 EmulatorSessionOwner.RestoreDisposition.FAILED;
         final AtomicInteger restores = new AtomicInteger();
@@ -659,6 +666,7 @@ public final class EmulatorSessionOwnerTest {
 
         @Override public CheckpointStore checkpointStore() { return checkpointStore; }
         @Override public HistoricalBranchStore historicalBranchStore() { return branchStore; }
+        @Override public ActiveTimelineStore activeTimelineStore() { return timelineStore; }
         @Override public EmulatorSessionOwner.RestoreDisposition restoreHistoricalBranch(
                 HistoricalBranchStore.Branch branch) {
             events.add("restore-branch");

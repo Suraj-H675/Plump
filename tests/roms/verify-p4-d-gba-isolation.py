@@ -21,6 +21,9 @@ def allcanonical():
  return {p.name:digest(p.read_bytes()) for p in sorted((WORK/'canonical-plsv').glob(SHA+'*'))}
 def journal(operation,timeline,source):
  subprocess.run(['java','-cp',str(CLASSES),'dev.plump.emulator.JournalCli',operation,str(WORK/(timeline+'-plsv')),SHA,str(source)],check=True)
+def active_timeline(operation,*extra):
+ subprocess.run(['java','-cp',str(CLASSES),'dev.plump.emulator.ActiveTimelineHostCli',
+  operation,str(WORK),'gba',SHA,digest(CORE.read_bytes()),*[str(item) for item in extra]],check=True)
 def begin(name,windows):
  folder=WORK/('core-'+name);folder.mkdir(parents=True,exist_ok=False)
  core,rb,rom,frames,audio,clock,refs=M.load_core('gba',str(CORE),str(ROM),folder)
@@ -90,11 +93,43 @@ def cold(timeline):
   assert allcanonical()==frozen,'Canonical file changed during GBA cold game execution'
   print('PASS GBA D1 COLD',timeline,'restored counter',original,'in-game KEY_A advanced',original+1,'PLSV untouched',flush=True)
  finally:close(core)
+
+def timeline_setup():
+ active_timeline('setup',WORK/'s_old.bin',WORK/'n_state.bin',WORK/'n_branch.bin')
+ frozen=json.loads((WORK/'frozen.json').read_text())
+ assert allcanonical()==frozen,'Selector publication changed canonical PLSV'
+ print('PASS GBA persisted active timeline seeded from real mGBA SRAM checkpoint and progressed branch',flush=True)
+
+def timeline_cold():
+ frozen=json.loads((WORK/'frozen.json').read_text());assert allcanonical()==frozen
+ active=WORK/'active-cold-native.bin'
+ active_timeline('resolve',active)
+ data=active.read_bytes();assert data==(WORK/'n_branch.bin').read_bytes()
+ check_byte(data,2)
+ # This new native-core process restores only the latest branch PLSV payload.
+ # It never consumes S_old, so a later native generation cannot be paired with it.
+ core,rb,rom,frames,audio,clock,refs=begin('timeline-cold',[(115,128)])
+ try:
+  memory=core.retro_get_memory_data(0);capacity=core.retro_get_memory_size(0)
+  assert memory and capacity in (len(data),131072)
+  if capacity!=len(data):ct.memset(memory,255,capacity)
+  ct.memmove(memory,data,len(data))
+  run(core,clock,range(80));check_byte(native(core),2)
+  run(core,clock,range(80,150));advanced=native(core);check_byte(advanced,3)
+  progressed=WORK/'n_branch_after_cold.bin';progressed.write_bytes(advanced)
+  active_timeline('write',progressed)
+  after=WORK/'active-after-write.bin';active_timeline('resolve',after)
+  assert after.read_bytes()==advanced and digest(after.read_bytes())==digest(advanced)
+  check_byte(after.read_bytes(),3)
+  assert allcanonical()==frozen,'Canonical files changed after process-resumed branch write'
+  print('PASS GBA FRESH-PROCESS POINTER -> latest N_branch counter=2 -> REAL mGBA KEY_A -> counter=3; canonical three-file SHA frozen',flush=True)
+ finally:close(core)
 if __name__=='__main__':
  if len(sys.argv)==2:
-  dict(first=first,branch=branch,canonical_cold=lambda:cold('canonical'),branch_cold=lambda:cold('branch'))[sys.argv[1]]()
+  dict(first=first,branch=branch,canonical_cold=lambda:cold('canonical'),branch_cold=lambda:cold('branch'),
+       timeline_setup=timeline_setup,timeline_cold=timeline_cold)[sys.argv[1]]()
  elif len(sys.argv)==1:
-  for stage in ('first','branch','canonical_cold','branch_cold'):
+  for stage in ('first','branch','canonical_cold','branch_cold','timeline_setup','timeline_cold'):
    log=WORK.parent/f'gba-{stage}.log'
    with log.open('w') as out:p=subprocess.run([sys.executable,str(Path(__file__).resolve()),stage],stdout=out,stderr=subprocess.STDOUT)
    if p.returncode:
