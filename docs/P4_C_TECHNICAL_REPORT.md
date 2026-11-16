@@ -256,6 +256,13 @@ cadence, local backup/export and target-phone state behavior are outstanding.
 Do not install the local APK and do not begin P4-D without a separate milestone
 assignment. There is no blanket DSi/3DS state capability claim.
 
-**Git checkpoint:** implementation SHA and the final report-stage commit are
-listed in the final handoff and the local `git log`; the report is committed
-on `main` after reviewing the explicit P4-C path allowlist. No remote push.
+**Exact implementation commit:** `98c4010dee7da9912db640ea3f833d4ef83b5efc`
+(`feat(p4-c): capture immutable pinned-core checkpoints with durable manifests`)
+on `main`, based on `5b786c1644419ae0cdd48fadaa04023e6a49bbdd`.
+It contains the 20 explicitly staged and source-reviewed P4-C paths, including
+the original version of this report. The present evidence reconciliation is a
+separate small documentation-only commit (visible as the succeeding `main` HEAD
+in `git log`; a commit cannot embed its own Git hash). **Final known working-tree
+status:** pre-existing ` M docs/P3_TECHNICAL_REPORT.md` and
+`?? docs/P4_ENGINEERING_PLAN.md` only. No remote push, APK publication,
+APK installation, core revision change or phone operation.
