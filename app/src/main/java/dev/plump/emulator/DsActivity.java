@@ -50,7 +50,12 @@ public final class DsActivity extends Activity {
     private Button pauseButton, expandButton;
     private TextView status;
     private GameSaveStore saveStore;
+    private GameSaveStore activeSaveStore;
     private CheckpointStore checkpointStore;
+    private HistoricalBranchStore branchStore;
+    private HistoricalBranchStore.Branch activeBranch;
+    private byte[] activeRom;
+    private File systemDirectory, canonicalCoreDirectory;
     private String gameId;
     private long frames, lastStats;
     private boolean coreReady, loaded, nativeGameLoaded, userPaused, foreground, enlarged;
@@ -216,6 +221,8 @@ public final class DsActivity extends Activity {
         try {
             File sys = new File(getFilesDir(), "nds-system");
             File coreSaves = new File(getFilesDir(), "nds-core-data");
+            systemDirectory = sys;
+            canonicalCoreDirectory = coreSaves;
             if ((!sys.isDirectory() && !sys.mkdirs()) ||
                 (!coreSaves.isDirectory() && !coreSaves.mkdirs()))
                 throw new IOException("Cannot create private core directories");
@@ -242,6 +249,10 @@ public final class DsActivity extends Activity {
                     if (fd != null) try { Os.close(fd); } catch (android.system.ErrnoException ignored) { }
                 }
             }, path -> new android.os.StatFs(path.toString()).getAvailableBytes(), point -> { });
+            branchStore = new HistoricalBranchStore(new File(getFilesDir(), "historical-branches").toPath(),
+                    directory -> syncPath(directory),
+                    path -> new android.os.StatFs(path.toString()).getAvailableBytes(),
+                    directory -> syncSaveDirectory(directory), point -> { });
             hostToken = sessionOwner.attach(EmulatorSessionOwner.Console.DS, new EmulatorSessionOwner.Host() {
                 @Override public boolean initializeCore() {
                     if (NativeDs.LOAD_ERROR != null) {
@@ -256,6 +267,9 @@ public final class DsActivity extends Activity {
                 @Override public boolean stopAndSave() { return DsActivity.this.stopAndSave(); }
                 @Override public boolean startLoops(long token) { return startOwnedLoops(token); }
                 @Override public CheckpointStore checkpointStore() { return checkpointStore; }
+                @Override public HistoricalBranchStore historicalBranchStore() { return branchStore; }
+                @Override public EmulatorSessionOwner.RestoreDisposition restoreHistoricalBranch(
+                        HistoricalBranchStore.Branch branch) { return restoreBranch(branch); }
                 @Override public CheckpointStore.Identity checkpointIdentity() {
                     if (gameId == null) return null;
                     try {
@@ -287,6 +301,9 @@ public final class DsActivity extends Activity {
                     if (nativeGameLoaded) NativeDs.unload();
                     nativeGameLoaded = loaded = false;
                     gameId = null;
+                    activeRom = null;
+                    activeBranch = null;
+                    activeSaveStore = saveStore;
                     frames = 0;
                 }
                 @Override public void shutdownCore() {
@@ -399,6 +416,9 @@ public final class DsActivity extends Activity {
                             android.util.Log.i("PlumpDS", "DS cartridge save restored and byte-verified: generation=" + prior.generation);
                         }
                         loaded = true;
+                        activeRom = bytes.clone();
+                        activeSaveStore = saveStore;
+                        activeBranch = null;
                         gameId = identity;
                         frames = 0;
                         userPaused = false;
@@ -409,6 +429,9 @@ public final class DsActivity extends Activity {
                         if (nativeGameLoaded) NativeDs.unload();
                         nativeGameLoaded = loaded = false;
                         gameId = null;
+                        activeRom = null;
+                        activeBranch = null;
+                        activeSaveStore = saveStore;
                         frames = 0;
                     }
                 });
@@ -606,7 +629,8 @@ public final class DsActivity extends Activity {
     }
 
     private boolean save(boolean report, long callbackRun) {
-        if (!loaded || frames == 0 || gameId == null || saveStore == null) return true;
+        GameSaveStore destination = activeSaveStore == null ? saveStore : activeSaveStore;
+        if (!loaded || frames == 0 || gameId == null || destination == null) return true;
         try {
             int size = NativeDs.saveSize();
             if (size == 0) return true; // Homebrew virtual SD files are NOT cartridge SRAM.
@@ -615,7 +639,7 @@ public final class DsActivity extends Activity {
             byte[] data = NativeDs.snapshot();
             if (data == null || data.length != size)
                 throw new IOException("DS cartridge SRAM returned no complete snapshot");
-            saveStore.write(gameId, data);
+            destination.write(gameId, data);
             return true;
         } catch (IOException failure) {
             if (callbackRun != 0) sessionOwner.noteSaveFailure(hostToken, callbackRun);
@@ -631,6 +655,89 @@ public final class DsActivity extends Activity {
             return false;
         }
     }
+
+    private EmulatorSessionOwner.RestoreDisposition restoreBranch(HistoricalBranchStore.Branch branch) {
+        byte[] rom = activeRom;
+        if (branch == null || rom == null || gameId == null || !gameId.equals(branch.identity.romSha256))
+            return EmulatorSessionOwner.RestoreDisposition.FAILED;
+        activeBranch = branch;
+        activeSaveStore = branch.saves; // Branch routing is installed before state load can touch EEPROM.
+        try {
+            retireCoreWithoutSave();
+            String issue = NativeDs.initialize(branch.systemDirectory.toString(), branch.coreDataDirectory.toString());
+            if (issue != null) throw new IllegalStateException(issue);
+            coreReady = true;
+            reattachSurfaces();
+            issue = NativeDs.load(rom);
+            if (issue != null) throw new IllegalStateException(issue);
+            nativeGameLoaded = true;
+            issue = NativeDs.restoreCheckpoint(branch.machineState(), branch.nativeSave());
+            if (issue != null) throw new IllegalStateException(issue);
+            loaded = true;
+            frames = 0;
+            userPaused = true;
+            return EmulatorSessionOwner.RestoreDisposition.RESTORED_PAUSED;
+        } catch (RuntimeException restoreFailure) {
+            android.util.Log.e("PlumpDS", "Historical DS restore failed; retiring the core before canonical fallback",
+                    restoreFailure);
+        }
+        try {
+            retireCoreWithoutSave();
+            activeBranch = null;
+            activeSaveStore = saveStore;
+            String issue = NativeDs.initialize(systemDirectory.getAbsolutePath(), canonicalCoreDirectory.getAbsolutePath());
+            if (issue != null) throw new IllegalStateException(issue);
+            coreReady = true;
+            reattachSurfaces();
+            issue = NativeDs.load(rom);
+            if (issue != null) throw new IllegalStateException(issue);
+            nativeGameLoaded = true;
+            GameSaveStore.Recovery canonical = saveStore.load(gameId);
+            if (canonical.warning != null && canonical.bytes == null)
+                throw new IllegalStateException("Canonical DS save recovery is invalid");
+            if (canonical.bytes != null) {
+                issue = NativeDs.restore(canonical.bytes);
+                byte[] readback = issue == null ? NativeDs.snapshot() : null;
+                if (issue != null || readback == null || !Arrays.equals(canonical.bytes, readback))
+                    throw new IllegalStateException("Canonical DS save cold fallback readback failed");
+            }
+            loaded = true;
+            frames = 0;
+            userPaused = true;
+            return EmulatorSessionOwner.RestoreDisposition.CANONICAL_FALLBACK_PAUSED;
+        } catch (RuntimeException fallbackFailure) {
+            android.util.Log.e("PlumpDS", "Canonical DS cold fallback failed", fallbackFailure);
+            try { retireCoreWithoutSave(); } catch (RuntimeException ignored) { }
+            return EmulatorSessionOwner.RestoreDisposition.FAILED;
+        }
+    }
+
+    private void reattachSurfaces() {
+        if (topDisplay != null && topDisplay.getHolder().getSurface().isValid())
+            NativeDs.topSurface(topDisplay.getHolder().getSurface());
+        if (bottom != null && bottom.getHolder().getSurface().isValid())
+            NativeDs.bottomSurface(bottom.getHolder().getSurface());
+    }
+
+    private void retireCoreWithoutSave() {
+        if (coreReady) NativeDs.shutdown();
+        coreReady = nativeGameLoaded = loaded = false;
+        frames = 0;
+    }
+
+    private void syncPath(java.nio.file.Path path) throws IOException {
+        FileDescriptor fd = null;
+        try {
+            fd = Os.open(path.toAbsolutePath().toString(), OsConstants.O_RDONLY, 0);
+            Os.fsync(fd);
+        } catch (android.system.ErrnoException failure) {
+            throw new IOException("Private branch directory sync failed", failure);
+        } finally {
+            if (fd != null) try { Os.close(fd); } catch (android.system.ErrnoException ignored) { }
+        }
+    }
+
+    private void syncSaveDirectory(File directory) throws IOException { syncPath(directory.toPath()); }
 
     @Override protected void onResume() {
         super.onResume();

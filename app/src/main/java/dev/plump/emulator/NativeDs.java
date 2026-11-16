@@ -23,6 +23,7 @@ final class NativeDs {
     static native int serializerCapabilities();
     static native int serializerApiVersion();
     static native byte[][] captureCheckpoint();
+    static native String restoreCheckpoint(byte[] machineState, byte[] nativeSave);
     static native int saveSize();
     static native byte[] snapshot();
     static native String restore(byte[] save);

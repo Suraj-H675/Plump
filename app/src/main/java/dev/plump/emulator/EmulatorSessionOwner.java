@@ -20,7 +20,24 @@ final class EmulatorSessionOwner {
         default CheckpointStore.Capture captureCheckpoint() {
             return CheckpointStore.Capture.unsupported(0, "Checkpoint serializer unavailable");
         }
+        default HistoricalBranchStore historicalBranchStore() { return null; }
+        default RestoreDisposition restoreHistoricalBranch(HistoricalBranchStore.Branch branch) {
+            return RestoreDisposition.FAILED;
+        }
         default void checkpointFailed(String message) { }
+    }
+
+    enum RestoreDisposition { RESTORED_PAUSED, CANONICAL_FALLBACK_PAUSED, FAILED }
+
+    static final class RestoreResult {
+        final RestoreDisposition disposition;
+        final String branchId;
+        final String error;
+        private RestoreResult(RestoreDisposition disposition, String branchId, String error) {
+            this.disposition = disposition;
+            this.branchId = branchId;
+            this.error = error;
+        }
     }
 
     interface GameLoader {
@@ -59,6 +76,7 @@ final class EmulatorSessionOwner {
         final String gameId;
         Phase phase;
         long runToken;
+        String branchId;
 
         Session(Console console, String gameId, Phase phase) {
             this.console = console;
@@ -364,12 +382,110 @@ final class EmulatorSessionOwner {
             synchronized (this) {
                 if (session.phase != Phase.PAUSED || exclusiveConsole != null)
                     throw new IOException("Checkpoint capture requires the exclusive paused session");
+                if (session.branchId != null)
+                    throw new IOException("Historical branches cannot publish canonical-tagged checkpoints");
                 exclusiveConsole = token.console;
             }
             try { return createCheckpoint(entry, session, CheckpointStore.Kind.MANUAL); }
             finally {
                 synchronized (this) { if (exclusiveConsole == token.console) exclusiveConsole = null; }
             }
+        } finally {
+            transitions.unlock();
+        }
+    }
+
+    /** Internal restore entry point. It deliberately has no Activity or public UI binding. */
+    RestoreResult restoreHistoricalCheckpoint(HostToken token, String checkpointId) {
+        transitions.lock();
+        try {
+            HostEntry entry = currentHost(token);
+            Session session = sessionFor(token);
+            if (entry == null || session == null || !entry.initialized)
+                return new RestoreResult(RestoreDisposition.FAILED, null, "No current loaded session");
+            synchronized (this) {
+                if (session.phase != Phase.PAUSED || exclusiveConsole != null || session.branchId != null)
+                    return new RestoreResult(RestoreDisposition.FAILED, null,
+                            "Historical restore requires an exclusive paused canonical session");
+                session.phase = Phase.QUIESCING;
+                exclusiveConsole = token.console;
+            }
+
+            boolean saved;
+            try { saved = entry.host.stopAndSave(); }
+            catch (RuntimeException failure) { saved = false; }
+            if (!saved) {
+                markRecovery(session, true);
+                return new RestoreResult(RestoreDisposition.FAILED, null,
+                        "Canonical save could not be durably quiesced");
+            }
+            try { publish(session, SessionReceiptStore.State.PAUSED); }
+            catch (IOException failure) {
+                markRecovery(session, true);
+                return new RestoreResult(RestoreDisposition.FAILED, null,
+                        "Paused session receipt could not be made durable");
+            }
+            synchronized (this) { session.phase = Phase.PAUSED; }
+
+            HistoricalBranchStore branches;
+            CheckpointStore checkpoints;
+            CheckpointStore.Identity identity;
+            try {
+                branches = entry.host.historicalBranchStore();
+                checkpoints = entry.host.checkpointStore();
+                identity = entry.host.checkpointIdentity();
+            } catch (RuntimeException unavailable) {
+                synchronized (this) { if (exclusiveConsole == token.console) exclusiveConsole = null; }
+                return new RestoreResult(RestoreDisposition.FAILED, null,
+                        "Pinned branch storage or identity is unavailable");
+            }
+            String expectedConsole = session.console == Console.GBA ? "gba" : "ds";
+            if (branches == null || checkpoints == null || identity == null ||
+                    !expectedConsole.equals(identity.console) || !session.gameId.equals(identity.romSha256)) {
+                synchronized (this) { if (exclusiveConsole == token.console) exclusiveConsole = null; }
+                return new RestoreResult(RestoreDisposition.FAILED, null,
+                        "Checkpoint identity does not match the owned game session");
+            }
+
+            HistoricalBranchStore.Branch branch;
+            try { branch = branches.create(checkpoints, checkpointId, identity); }
+            catch (IOException | RuntimeException failure) {
+                synchronized (this) { if (exclusiveConsole == token.console) exclusiveConsole = null; }
+                return new RestoreResult(RestoreDisposition.FAILED, null,
+                        failure.getMessage() == null ? "Historical branch creation failed" : failure.getMessage());
+            }
+
+            RestoreDisposition disposition;
+            try { disposition = entry.host.restoreHistoricalBranch(branch); }
+            catch (RuntimeException failure) { disposition = RestoreDisposition.FAILED; }
+            if (disposition == RestoreDisposition.RESTORED_PAUSED) {
+                synchronized (this) {
+                    session.branchId = branch.id;
+                    session.phase = Phase.PAUSED;
+                    if (exclusiveConsole == token.console) exclusiveConsole = null;
+                }
+                return new RestoreResult(disposition, branch.id, null);
+            }
+
+            String error = disposition == RestoreDisposition.CANONICAL_FALLBACK_PAUSED
+                    ? "Historical restore failed; canonical save was cold-restored"
+                    : "Historical restore and cold canonical fallback both failed; host retired";
+            boolean quarantined = true;
+            try { branches.quarantine(branch.id); }
+            catch (IOException quarantineFailure) {
+                quarantined = false;
+                error += "; branch quarantine failed: " + quarantineFailure.getMessage();
+            }
+            if (disposition == RestoreDisposition.CANONICAL_FALLBACK_PAUSED && quarantined) {
+                synchronized (this) {
+                    session.phase = Phase.PAUSED;
+                    if (exclusiveConsole == token.console) exclusiveConsole = null;
+                }
+            } else {
+                markRecovery(session, true);
+            }
+            return new RestoreResult(disposition == RestoreDisposition.CANONICAL_FALLBACK_PAUSED && quarantined
+                    ? disposition : RestoreDisposition.FAILED, branch.id, error);
         } finally {
             transitions.unlock();
         }
@@ -395,6 +511,7 @@ final class EmulatorSessionOwner {
     }
 
     private void maybeCreateAutoCheckpoint(HostEntry entry, Session session) {
+        synchronized (this) { if (session.branchId != null) return; }
         try { createCheckpoint(entry, session, CheckpointStore.Kind.AUTO); }
         catch (IOException | RuntimeException failure) {
             try { entry.host.checkpointFailed(failure.getMessage()); }

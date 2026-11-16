@@ -205,6 +205,64 @@ int main(int argc, char** argv) {
     jbyteArray afterOwnerArray = Java_dev_plump_emulator_NativeCore_snapshotSaveRam(env, nullptr);
     assert(afterOwnerArray && copy(env, afterOwnerArray) == before);
     env->DeleteLocalRef(afterOwnerArray);
+    for (int frame = 0; frame < 20; ++frame) Java_dev_plump_emulator_NativeCore_runFrame(env, nullptr);
+    jbyteArray statePair = bytes(env, first.first);
+    jbyteArray nativePair = bytes(env, first.second);
+    assert(!Java_dev_plump_emulator_NativeCore_restoreCheckpoint(env, nullptr, statePair, nativePair));
+    jbyteArray restoredArray = Java_dev_plump_emulator_NativeCore_snapshotSaveRam(env, nullptr);
+    assert(restoredArray && copy(env, restoredArray) == first.second);
+    env->DeleteLocalRef(restoredArray);
+    std::vector<uint8_t> shortState(first.first.begin(), first.first.end() - 1);
+    jbyteArray shortStateArray = bytes(env, shortState);
+    jstring rejected = Java_dev_plump_emulator_NativeCore_restoreCheckpoint(
+            env, nullptr, shortStateArray, nativePair);
+    assert(rejected);
+    env->DeleteLocalRef(rejected);
+    restoredArray = Java_dev_plump_emulator_NativeCore_snapshotSaveRam(env, nullptr);
+    assert(restoredArray && copy(env, restoredArray) == first.second);
+    env->DeleteLocalRef(restoredArray);
+    std::vector<uint8_t> shortNative(first.second.begin(), first.second.end() - 1);
+    jbyteArray shortNativeArray = bytes(env, shortNative);
+    rejected = Java_dev_plump_emulator_NativeCore_restoreCheckpoint(
+            env, nullptr, statePair, shortNativeArray);
+    assert(rejected);
+    env->DeleteLocalRef(rejected);
+    restoredArray = Java_dev_plump_emulator_NativeCore_snapshotSaveRam(env, nullptr);
+    assert(restoredArray && copy(env, restoredArray) == first.second);
+    env->DeleteLocalRef(restoredArray);
+
+    // Production D3 uses a fresh, branch-owned mGBA instance. A newly loaded
+    // cartridge initially reports provisional 128-KiB SRAM and the wrong
+    // serialization size; priming one branch-only frame resolves its geometry.
+    Java_dev_plump_emulator_NativeCore_unloadGame(env, nullptr);
+    Java_dev_plump_emulator_NativeCore_shutdown(env, nullptr);
+    assert(!Java_dev_plump_emulator_NativeCore_initialize(env, nullptr));
+    romArray = bytes(env, rom);
+    assert(!Java_dev_plump_emulator_NativeCore_loadGame(env, nullptr, romArray));
+    env->DeleteLocalRef(romArray);
+    assert(Java_dev_plump_emulator_NativeCore_saveRamSize(env, nullptr) == 131072);
+    rejected = Java_dev_plump_emulator_NativeCore_restoreCheckpoint(env, nullptr, statePair, nativePair);
+    assert(rejected && "Unprimed GBA must reject mismatched SRAM/state geometry");
+    env->DeleteLocalRef(rejected);
+    Java_dev_plump_emulator_NativeCore_setButtons(env, nullptr, 0);
+    Java_dev_plump_emulator_NativeCore_runFrame(env, nullptr);
+    Java_dev_plump_emulator_NativeCore_discardAudio(env, nullptr);
+    assert(Java_dev_plump_emulator_NativeCore_saveRamSize(env, nullptr) == 32768);
+    assert(!Java_dev_plump_emulator_NativeCore_restoreCheckpoint(env, nullptr, statePair, nativePair));
+    restoredArray = Java_dev_plump_emulator_NativeCore_snapshotSaveRam(env, nullptr);
+    assert(restoredArray && copy(env, restoredArray) == first.second);
+    env->DeleteLocalRef(restoredArray);
+    for (int frame = 0; frame < 5; ++frame) Java_dev_plump_emulator_NativeCore_runFrame(env, nullptr);
+    restoredArray = Java_dev_plump_emulator_NativeCore_snapshotSaveRam(env, nullptr);
+    assert(restoredArray && copy(env, restoredArray) == first.second);
+    env->DeleteLocalRef(restoredArray);
+    std::puts("PASS JNI FRESH BRANCH RESTORE: mGBA 128-KiB provisional geometry rejects, 1-frame 32-KiB geometry restores pinned historical pair");
+
+    env->DeleteLocalRef(shortNativeArray);
+    env->DeleteLocalRef(shortStateArray);
+    env->DeleteLocalRef(statePair);
+    env->DeleteLocalRef(nativePair);
+    std::puts("PASS JNI HISTORICAL RESTORE: mGBA exact state/native pair and SRAM readback; wrong state length rejected");
     std::printf("PASS JNI CHECKPOINT: mGBA API v1 state=%zu bytes native=%zu bytes stable twice; SRAM unchanged\n",
                 first.first.size(), first.second.size());
     Java_dev_plump_emulator_NativeCore_unloadGame(env, nullptr);

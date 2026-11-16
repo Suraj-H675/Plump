@@ -116,6 +116,8 @@ bool environment(unsigned command, void* data) {
                 {"melonds_network_mode", "disabled"},
                 {"melonds_homebrew_sdcard", "disabled"},
                 {"melonds_homebrew_sync_sdcard_to_host", "disabled"},
+                {"melonds_dsi_sdcard", "disabled"},
+                {"melonds_dsi_sdcard_sync_sdcard_to_host", "disabled"},
                 {"melonds_console_mode", "ds"},
                 {"melonds_boot_mode", "direct"},
                 {"melonds_sysfile_mode", "builtin"},
@@ -416,6 +418,53 @@ Java_dev_plump_emulator_NativeDs_captureCheckpoint(JNIEnv* env, jclass) {
         return nullptr;
     }
 }
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_dev_plump_emulator_NativeDs_restoreCheckpoint(JNIEnv* env, jclass, jbyteArray stateArray,
+                                                    jbyteArray nativeArray) {
+    std::lock_guard<std::mutex> lock(coreMutex);
+    constexpr size_t MAX_MACHINE_BYTES = 64 * 1024 * 1024;
+    constexpr size_t MAX_NATIVE_BYTES = 1024 * 1024;
+    if (!loaded || !stateArray || !nativeArray || !api.unserialize ||
+            !api.serializeSize || !api.apiVersion || api.apiVersion() != 1)
+        return problem(env, "Pinned melonDS state restore is unavailable");
+    const jsize stateLength = env->GetArrayLength(stateArray);
+    const jsize nativeLength = env->GetArrayLength(nativeArray);
+    const size_t expectedState = api.serializeSize();
+    const size_t expectedNative = api.memorySize(0);
+    if (stateLength <= 0 || static_cast<size_t>(stateLength) > MAX_MACHINE_BYTES ||
+            static_cast<size_t>(stateLength) != expectedState || nativeLength <= 0 ||
+            static_cast<size_t>(nativeLength) > MAX_NATIVE_BYTES ||
+            static_cast<size_t>(nativeLength) != expectedNative || !api.memoryData(0))
+        return problem(env, "Pinned melonDS checkpoint lengths do not match the loaded core");
+    try {
+        std::vector<uint8_t> state(static_cast<size_t>(stateLength));
+        std::vector<uint8_t> nativeSave(static_cast<size_t>(nativeLength));
+        env->GetByteArrayRegion(stateArray, 0, stateLength, reinterpret_cast<jbyte*>(state.data()));
+        if (env->ExceptionCheck()) return problem(env, "Cannot read checkpoint machine state");
+        env->GetByteArrayRegion(nativeArray, 0, nativeLength, reinterpret_cast<jbyte*>(nativeSave.data()));
+        if (env->ExceptionCheck()) return problem(env, "Cannot read checkpoint native save");
+        if (!api.unserialize(state.data(), state.size()))
+            return problem(env, "Pinned melonDS rejected checkpoint machine state");
+
+        // melonDS state loading can roll EEPROM back through its native save buffer.
+        // Reacquire that buffer after unserialize and install the selected N_state.
+        size_t afterSize = api.memorySize(0);
+        void* afterData = api.memoryData(0);
+        if (!afterData || afterSize != nativeSave.size())
+            return problem(env, "melonDS native save region changed after state restore");
+        std::memcpy(afterData, nativeSave.data(), nativeSave.size());
+        afterSize = api.memorySize(0);
+        afterData = api.memoryData(0);
+        if (!afterData || afterSize != nativeSave.size() ||
+                std::memcmp(afterData, nativeSave.data(), nativeSave.size()) != 0)
+            return problem(env, "melonDS native save readback mismatch after state restore");
+        return nullptr;
+    } catch (const std::bad_alloc&) {
+        return problem(env, "Not enough memory for bounded melonDS state restore");
+    }
+}
+
 extern "C" JNIEXPORT jint JNICALL
 Java_dev_plump_emulator_NativeDs_saveSize(JNIEnv*, jclass) {
     std::lock_guard<std::mutex> lock(coreMutex);

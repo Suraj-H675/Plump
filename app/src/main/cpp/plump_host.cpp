@@ -314,7 +314,7 @@ Java_dev_plump_emulator_NativeCore_captureCheckpoint(JNIEnv* env, jclass) {
         std::memcpy(nativeSave.data(), nativeData, nativeSize);
         if (!core.serialize(state.data(), state.size())) return nullptr;
 
-        const size_t afterSize = core.memorySize(0);
+        size_t afterSize = core.memorySize(0);
         void* afterData = core.memoryData(0);
         if (!afterData || afterSize != nativeSize ||
                 std::memcmp(afterData, nativeSave.data(), nativeSize) != 0) {
@@ -354,6 +354,53 @@ Java_dev_plump_emulator_NativeCore_captureCheckpoint(JNIEnv* env, jclass) {
         return env->ExceptionCheck() ? nullptr : result;
     } catch (const std::bad_alloc&) {
         return nullptr;
+    }
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_dev_plump_emulator_NativeCore_restoreCheckpoint(JNIEnv* env, jclass, jbyteArray stateArray,
+                                                      jbyteArray nativeArray) {
+    std::lock_guard<std::mutex> lock(coreMutex);
+    constexpr size_t MAX_MACHINE_BYTES = 64 * 1024 * 1024;
+    constexpr size_t MAX_NATIVE_BYTES = 1024 * 1024;
+    if (!gameLoaded || !stateArray || !nativeArray || !core.unserialize ||
+            !core.serializeSize || !core.apiVersion || core.apiVersion() != 1)
+        return error(env, "Pinned mGBA state restore is unavailable");
+    const jsize stateLength = env->GetArrayLength(stateArray);
+    const jsize nativeLength = env->GetArrayLength(nativeArray);
+    const size_t expectedState = core.serializeSize();
+    const size_t expectedNative = core.memorySize(0);
+    if (stateLength <= 0 || static_cast<size_t>(stateLength) > MAX_MACHINE_BYTES ||
+            static_cast<size_t>(stateLength) != expectedState || nativeLength <= 0 ||
+            static_cast<size_t>(nativeLength) > MAX_NATIVE_BYTES ||
+            static_cast<size_t>(nativeLength) != expectedNative || !core.memoryData(0))
+        return error(env, "Pinned mGBA checkpoint lengths do not match the loaded core");
+    try {
+        std::vector<uint8_t> state(static_cast<size_t>(stateLength));
+        std::vector<uint8_t> nativeSave(static_cast<size_t>(nativeLength));
+        env->GetByteArrayRegion(stateArray, 0, stateLength, reinterpret_cast<jbyte*>(state.data()));
+        if (env->ExceptionCheck()) return error(env, "Cannot read checkpoint machine state");
+        env->GetByteArrayRegion(nativeArray, 0, nativeLength, reinterpret_cast<jbyte*>(nativeSave.data()));
+        if (env->ExceptionCheck()) return error(env, "Cannot read checkpoint native save");
+        if (!core.unserialize(state.data(), state.size()))
+            return error(env, "Pinned mGBA rejected checkpoint machine state");
+
+        // State loading can rewind the core's SRAM. Reacquire its current pointer and
+        // bind the verified native half of the pair after unserialize.
+        size_t afterSize = core.memorySize(0);
+        void* afterData = core.memoryData(0);
+        if (!afterData || afterSize != nativeSave.size())
+            return error(env, "mGBA native save region changed after state restore");
+        std::memcpy(afterData, nativeSave.data(), nativeSave.size());
+        afterSize = core.memorySize(0);
+        afterData = core.memoryData(0);
+        if (!afterData || afterSize != nativeSave.size() ||
+                std::memcmp(afterData, nativeSave.data(), nativeSave.size()) != 0)
+            return error(env, "mGBA native save readback mismatch after state restore");
+        hasRunFrame = true;
+        return nullptr;
+    } catch (const std::bad_alloc&) {
+        return error(env, "Not enough memory for bounded mGBA state restore");
     }
 }
 

@@ -5,6 +5,7 @@ import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.List;
@@ -383,6 +384,66 @@ public final class EmulatorSessionOwnerTest {
         assertEquals(1, records.stream().filter(r -> r.kind == CheckpointStore.Kind.AUTO).count());
     }
 
+    @Test public void historicalRestoreRequiresPausedCanonicalSessionAndSuppressesCanonicalCheckpointing() throws Exception {
+        Path root = temporary.newFolder().toPath();
+        EmulatorSessionOwner owner = new EmulatorSessionOwner();
+        FakeHost host = new FakeHost();
+        host.checkpointStore = new CheckpointStore(root.resolve("checkpoints"));
+        host.checkpointIdentity = checkpointIdentity(GAME_A);
+        host.checkpointCapture = CheckpointStore.Capture.supported(1, new byte[]{1, 2, 3}, new byte[]{4, 5});
+        host.branchStore = new HistoricalBranchStore(root.resolve("branches"), ignored -> { },
+                ignored -> Long.MAX_VALUE, ignored -> { }, ignored -> { });
+        host.restoreDisposition = EmulatorSessionOwner.RestoreDisposition.RESTORED_PAUSED;
+        CheckpointStore.Record historical = host.checkpointStore.create(host.checkpointIdentity,
+                host.checkpointCapture, CheckpointStore.Kind.MANUAL);
+        EmulatorSessionOwner.HostToken token = attach(owner, root.resolve("receipts"),
+                EmulatorSessionOwner.Console.GBA, host);
+        assertTrue(owner.initialize(token));
+        assertTrue(open(owner, token, GAME_A).opened);
+        assertTrue(owner.resume(token));
+        EmulatorSessionOwner.RestoreResult running = owner.restoreHistoricalCheckpoint(token, historical.id);
+        assertEquals(EmulatorSessionOwner.RestoreDisposition.FAILED, running.disposition);
+        assertTrue(owner.pause(token));
+        host.checkpointCaptures.set(0);
+
+        EmulatorSessionOwner.RestoreResult result = owner.restoreHistoricalCheckpoint(token, historical.id);
+        assertEquals(EmulatorSessionOwner.RestoreDisposition.RESTORED_PAUSED, result.disposition);
+        assertNotNull(result.branchId);
+        assertTrue(host.events.indexOf("stop-save") < host.events.indexOf("restore-branch"));
+        assertEquals(1, host.restores.get());
+        try { owner.createManualCheckpoint(token); fail("Branch cannot publish canonical checkpoint metadata"); }
+        catch (IOException expected) { assertTrue(expected.getMessage().contains("branch")); }
+        assertTrue(owner.resume(token));
+        assertTrue(owner.pause(token));
+        assertEquals("No auto checkpoint may be tagged canonical after branch selection", 0,
+                host.checkpointCaptures.get());
+        assertTrue(host.checkpointStore.listValid(host.checkpointIdentity).stream()
+                .allMatch(record -> "canonical".equals(record.branchId)));
+    }
+
+    @Test public void failedHistoricalRestoreQuarantinesBranchAfterCanonicalFallback() throws Exception {
+        Path root = temporary.newFolder().toPath();
+        EmulatorSessionOwner owner = new EmulatorSessionOwner();
+        FakeHost host = new FakeHost();
+        host.checkpointStore = new CheckpointStore(root.resolve("checkpoints"));
+        host.checkpointIdentity = checkpointIdentity(GAME_A);
+        host.checkpointCapture = CheckpointStore.Capture.supported(1, new byte[]{9, 8, 7}, new byte[]{6, 5});
+        host.branchStore = new HistoricalBranchStore(root.resolve("branches"), ignored -> { },
+                ignored -> Long.MAX_VALUE, ignored -> { }, ignored -> { });
+        host.restoreDisposition = EmulatorSessionOwner.RestoreDisposition.CANONICAL_FALLBACK_PAUSED;
+        CheckpointStore.Record historical = host.checkpointStore.create(host.checkpointIdentity,
+                host.checkpointCapture, CheckpointStore.Kind.MANUAL);
+        EmulatorSessionOwner.HostToken token = attach(owner, root.resolve("receipts"),
+                EmulatorSessionOwner.Console.GBA, host);
+        assertTrue(owner.initialize(token));
+        assertTrue(open(owner, token, GAME_A).opened);
+
+        EmulatorSessionOwner.RestoreResult result = owner.restoreHistoricalCheckpoint(token, historical.id);
+        assertEquals(EmulatorSessionOwner.RestoreDisposition.CANONICAL_FALLBACK_PAUSED, result.disposition);
+        assertTrue(Files.isDirectory(root.resolve("branches").resolve("quarantine-" + result.branchId)));
+        assertTrue(owner.resume(token));
+    }
+
     @Test public void exclusiveOwnerLockPreventsCloseDuringPausedCapture() throws Exception {
         Path root = temporary.newFolder().toPath();
         EmulatorSessionOwner owner = new EmulatorSessionOwner();
@@ -551,6 +612,10 @@ public final class EmulatorSessionOwnerTest {
         volatile CountDownLatch captureEntered;
         volatile CountDownLatch allowCapture;
         volatile String checkpointFailure;
+        volatile HistoricalBranchStore branchStore;
+        volatile EmulatorSessionOwner.RestoreDisposition restoreDisposition =
+                EmulatorSessionOwner.RestoreDisposition.FAILED;
+        final AtomicInteger restores = new AtomicInteger();
 
         @Override public boolean initializeCore() {
             initializations.incrementAndGet();
@@ -593,6 +658,13 @@ public final class EmulatorSessionOwnerTest {
         }
 
         @Override public CheckpointStore checkpointStore() { return checkpointStore; }
+        @Override public HistoricalBranchStore historicalBranchStore() { return branchStore; }
+        @Override public EmulatorSessionOwner.RestoreDisposition restoreHistoricalBranch(
+                HistoricalBranchStore.Branch branch) {
+            events.add("restore-branch");
+            restores.incrementAndGet();
+            return restoreDisposition;
+        }
         @Override public CheckpointStore.Identity checkpointIdentity() { return checkpointIdentity; }
         @Override public CheckpointStore.Capture captureCheckpoint() {
             checkpointCaptures.incrementAndGet();

@@ -319,6 +319,28 @@ int main(int argc, char** argv) {
 #endif
     frames(env, 90, false);                  // EEPROM diagnostic without pressing A
     assert(snapshot(env) == saved);
+#ifndef PLUMP_TEST_OLD_ADAPTER
+    jbyteArray branchState = bytes(env, checkpointA.first);
+    jbyteArray branchNative = bytes(env, checkpointA.second);
+    assert(consume(env, Java_dev_plump_emulator_NativeDs_restoreCheckpoint(
+            env, nullptr, branchState, branchNative)).empty());
+    assert(snapshot(env) == saved);
+    std::vector<uint8_t> shortState(checkpointA.first.begin(), checkpointA.first.end() - 1);
+    jbyteArray shortStateArray = bytes(env, shortState);
+    assert(!consume(env, Java_dev_plump_emulator_NativeDs_restoreCheckpoint(
+            env, nullptr, shortStateArray, branchNative)).empty());
+    assert(snapshot(env) == saved);
+    std::vector<uint8_t> shortNative(checkpointA.second.begin(), checkpointA.second.end() - 1);
+    jbyteArray shortNativeArray = bytes(env, shortNative);
+    assert(!consume(env, Java_dev_plump_emulator_NativeDs_restoreCheckpoint(
+            env, nullptr, branchState, shortNativeArray)).empty());
+    assert(snapshot(env) == saved);
+    env->DeleteLocalRef(shortNativeArray);
+    env->DeleteLocalRef(shortStateArray);
+    env->DeleteLocalRef(branchState);
+    env->DeleteLocalRef(branchNative);
+    std::puts("PASS JNI HISTORICAL RESTORE: melonDS exact state/native pair and EEPROM readback; wrong state length rejected");
+#endif
     Java_dev_plump_emulator_NativeDs_unload(env, nullptr);
 
     reject(env, std::vector<uint8_t>(511, 0)); // invalid length after unload

@@ -236,6 +236,37 @@ final class CheckpointStore {
         return readAndVerify(root.resolve("slot-" + id), expected);
     }
 
+    /** Reads a checkpoint only after validating its immutable manifest and both blobs. */
+    synchronized Pair readPair(String id, Identity expected) throws IOException {
+        Record record = verify(id, expected);
+        Path slot = root.resolve("slot-" + record.id);
+        Path machinePath = slot.resolve("machine.bin");
+        Path nativePath = slot.resolve("native.bin");
+        if (!Files.isDirectory(slot, LinkOption.NOFOLLOW_LINKS) ||
+                !Files.isRegularFile(machinePath, LinkOption.NOFOLLOW_LINKS) ||
+                !Files.isRegularFile(nativePath, LinkOption.NOFOLLOW_LINKS))
+            throw new IOException("Checkpoint pair is no longer a regular published record");
+        byte[] machine = readBounded(machinePath, (int) record.machineLength);
+        byte[] nativeSave = readBounded(nativePath, (int) record.nativeLength);
+        if (machine.length != record.machineLength || nativeSave.length != record.nativeLength ||
+                !record.machineSha256.equals(sha256(machine)) ||
+                !record.nativeSha256.equals(sha256(nativeSave)))
+            throw new IOException("Checkpoint changed while its verified pair was read");
+        return new Pair(record, machine, nativeSave);
+    }
+
+    static final class Pair {
+        final Record record;
+        final byte[] machineState;
+        final byte[] nativeSave;
+
+        private Pair(Record record, byte[] machineState, byte[] nativeSave) {
+            this.record = record;
+            this.machineState = machineState;
+            this.nativeSave = nativeSave;
+        }
+    }
+
     synchronized List<Record> listValid(Identity expected) throws IOException {
         if (expected == null) throw new IOException("Expected checkpoint identity is missing");
         ensureRoot();

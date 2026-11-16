@@ -24,6 +24,7 @@ final class NativeCore {
     static native int serializerCapabilities();
     static native int serializerApiVersion();
     static native byte[][] captureCheckpoint();
+    static native String restoreCheckpoint(byte[] machineState, byte[] nativeSave);
     static native byte[] snapshotSaveRam();
     static String restoreSaveRam(byte[] bytes) {
         if (bytes == null) return "No saved SRAM data";
