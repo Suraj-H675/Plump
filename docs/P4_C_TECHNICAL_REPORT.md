@@ -7,6 +7,15 @@ lint passed from the canonical host shell. No APK was installed and no Android
 device checkpoint performance or power-loss verification was authorized. This
 report does not claim full SAV or P4 acceptance.
 
+**Mastermind P4-C targeted REWORK (2026-11-16): corrected and host-verified.**
+The earlier candidate incorrectly pinned the *unstripped mGBA build input* as
+the installed binary. Gradle strips mGBA before APK packaging. The production
+pin is now the independently measured APK-packaged ELF digest; explicit debug
+and release pins are individually checked against rebuilt APKs, without relaxing
+runtime hashing. The final rebuild passed **80/80 JVM tests**, both ARM64
+assemblies, lint and both real pinned-core host integration suites. Details and
+remaining Android-device limitations are recorded below.
+
 ## Scope and safety boundary
 
 The change binds the optional Libretro serializer API in the existing mGBA and
@@ -61,15 +70,20 @@ player save was read or restored.
 
 ## Pinned cores and measured host results
 
-The Android identity code verifies the installed arm64 core file against the
-existing pinned binary digest before recording a checkpoint. Host integration
-uses source-built Linux cores from the same pinned source revisions; these host
-binary digests are different from the arm64 digests and are listed separately.
+The Android identity code verifies the actual file in `nativeLibraryDir`
+against the **packaged variant's** pinned ELF SHA-256 before recording a
+checkpoint. The former mGBA input SHA was not the installed-file digest, causing
+a genuine Android GBA checkpoint to be rejected. Under `useLegacyPackaging true`
+the APK native libraries are extracted for installation. Both current debug
+and release ELF bytes were independently measured; a future change in either
+variant must update its own verified pin after explicit review. Host integration
+uses source-built Linux cores from the same pinned revisions; their digests
+are unrelated to the Android packaged ELF bytes.
 
-| Console/core | Source revision(s) | Installed arm64 binary SHA-256 | Tested host binary SHA-256 | Fixture |
-|---|---|---|---|---|
-| GBA / mGBA Libretro | `d58ea8a86f30598fbf3958585de3d33028535072` | `05c9a63ed92b9dee8ac802992d9852c02a03515dd99b42d8b654b03434db4429` | `af229495b5cbbff309cfa49d50fbe7dbdce2e26aad1deb4f79e9bd7fa9e2ff7c` | Licensed MIT SRAM fixture; ROM SHA-256 `a37ad99c31e3f805eb05a00e498b65bd78e6f43a0a139cd695bea1f88229af2c` |
-| DS / melonDS Libretro | core `16f127dbb587a73371827ce79689c5d237c4b59b`; Libretro frontend `f394adbacb5722ee97c1b37c8064da9a25818310` | `83e7b9389083576d70c05466911f4796a8099bc1b43f5d56381c493c0d950c30` | `e8c5fd156e9d1fe9fa861cd93cc0ef25ddc7eecb0ccf65a6a6a8c4695e577616` | CC0 synthetic EEPROM fixture; ROM SHA-256 `6d863811a7831129b06a0aa07db5955553b69b0fc4748f1fa6e3506de45d4f70` |
+| Console/core | Source revision(s) | Unstripped arm64 input SHA-256 (provenance only) | Installed debug **and verified release** SHA-256 | Tested Linux-host binary SHA-256 | Fixture |
+|---|---|---|---|---|---|
+| GBA / mGBA Libretro | `d58ea8a86f30598fbf3958585de3d33028535072` | `05c9a63ed92b9dee8ac802992d9852c02a03515dd99b42d8b654b03434db4429` | `10353b6c5eb8ace7a7ed1205173554b597b9b76738a2363b69e1de12c40991b6` | `af229495b5cbbff309cfa49d50fbe7dbdce2e26aad1deb4f79e9bd7fa9e2ff7c` | Licensed MIT SRAM fixture; ROM SHA-256 `a37ad99c31e3f805eb05a00e498b65bd78e6f43a0a139cd695bea1f88229af2c` |
+| DS / melonDS Libretro | core `16f127dbb587a73371827ce79689c5d237c4b59b`; Libretro frontend `f394adbacb5722ee97c1b37c8064da9a25818310` | `83e7b9389083576d70c05466911f4796a8099bc1b43f5d56381c493c0d950c30` | `83e7b9389083576d70c05466911f4796a8099bc1b43f5d56381c493c0d950c30` | `e8c5fd156e9d1fe9fa861cd93cc0ef25ddc7eecb0ccf65a6a6a8c4695e577616` | CC0 synthetic EEPROM fixture; ROM SHA-256 `6d863811a7831129b06a0aa07db5955553b69b0fc4748f1fa6e3506de45d4f70` |
 
 Each test ran real frames before capture. Five same-boundary serializations
 produced identical bytes, serialization left SRAM/EEPROM unchanged, and a
@@ -266,3 +280,98 @@ in `git log`; a commit cannot embed its own Git hash). **Final known working-tre
 status:** pre-existing ` M docs/P3_TECHNICAL_REPORT.md` and
 `?? docs/P4_ENGINEERING_PLAN.md` only. No remote push, APK publication,
 APK installation, core revision change or phone operation.
+
+## 2026-11-16 mastermind REWORK closeout — packaged core identity
+
+**Defect:** the P4-C baseline `PinnedCheckpointIdentity.MGBA_BINARY_SHA256`
+matched `app/src/main/jniLibs/arm64-v8a/libmgba_libretro.so` but not the
+stripped ELF installed from either Android APK. `gba()` reads the actual ELF
+under `context.getApplicationInfo().nativeLibraryDir`, so the original
+implementation would reject the valid shipped mGBA and prevent GBA checkpoints.
+The DS binary was unaffected.
+
+**Correction:** production now separates `MGBA_UNSTRIPPED_INPUT_SHA256` and
+`MELONDS_UNSTRIPPED_INPUT_SHA256` (source provenance only) from the independently
+pinned debug/release **APK-packaged** hashes. `ApplicationInfo.FLAG_DEBUGGABLE`
+selects the expected debug or release digest. `verifyInstalledBinary` continues
+to SHA-256-hash the *actual* installed file; mismatched or missing native files
+fail closed. A future release binary is **not** assumed identical to debug:
+each variant has its own constant and must independently pass the APK regression
+after every toolchain/native-core/packaging change. These two builds happen to
+produce byte-identical core ELFs. The original mGBA and melonDS source Git
+revisions, native serializer binding, checkpoint manifest schema, PLSV v1 and
+P4-BR reload logic remain unchanged.
+
+| Source / packaging stage | mGBA length and SHA-256 | melonDS length and SHA-256 |
+|---|---|---|
+| Unstripped `app/src/main/jniLibs/arm64-v8a/` input | 7,063,880 B · `05c9a63ed92b9dee8ac802992d9852c02a03515dd99b42d8b654b03434db4429` | 5,590,904 B · `83e7b9389083576d70c05466911f4796a8099bc1b43f5d56381c493c0d950c30` |
+| Gradle `stripped_native_libs/debug` and `stripped_native_libs/release` | 3,071,512 B · `10353b6c5eb8ace7a7ed1205173554b597b9b76738a2363b69e1de12c40991b6` | 5,590,904 B · `83e7b9389083576d70c05466911f4796a8099bc1b43f5d56381c493c0d950c30` |
+| Both new APK `lib/arm64-v8a/*.so` ZIP entries, fully decompressed | 3,071,512 B · `10353b6c5eb8ace7a7ed1205173554b597b9b76738a2363b69e1de12c40991b6` | 5,590,904 B · `83e7b9389083576d70c05466911f4796a8099bc1b43f5d56381c493c0d950c30` |
+| Frozen accepted v8 debug APK ZIP entries (independent historical comparison) | 3,071,512 B · `10353b6c5eb8ace7a7ed1205173554b597b9b76738a2363b69e1de12c40991b6` | 5,590,904 B · `83e7b9389083576d70c05466911f4796a8099bc1b43f5d56381c493c0d950c30` |
+
+**Exact APK hashes:** frozen accepted v8 debug
+`8be596f0258579fcc8463243fc20ccbb27b77eb33a9a6270159667bc2645e38c`;
+new local P4-C repair debug
+`0779fa416c8b92314c92b4afe9fe3cdd5d0627a901be716faa31b6362016224c`;
+new local **unsigned** release
+`9d3b5f19fd8c5c2768bed7a30478f4e7b1083614831a1de419b7be6779ed950e`.
+The three whole-APK hashes differ, while the pinned extracted ELF hashes agree.
+The debug APK is built, **not installed**, and the release APK is unsigned.
+
+**Automated packaging regression:**
+
+```sh
+export ANDROID_HOME="$HOME/Android/Sdk" ANDROID_SDK_ROOT="$HOME/Android/Sdk"
+./gradlew --offline --no-daemon :app:testDebugUnitTest :app:assembleDebug :app:assembleRelease :app:lintDebug
+python3 scripts/test-p4-c-packaged-core-identity.py --negative-test
+bash scripts/test-p4-c-checkpoints.sh
+```
+
+The Python regression reads the literal production pin constants and checks
+each rebuilt APK's **real decompressed ELF bytes**, Gradle stripped intermediates,
+and unstripped upstream inputs. It extracts each APK ELF into an ignored
+project-local scratch directory and invokes the **actual compiled production
+Java** `packagedDigestForVariant` and `verifyInstalledBinary` methods. Both
+variants and both cores passed positive runtime checks. A one-byte-modified
+copy of mGBA was **rejected by the production Java method** for both variants.
+The original **unstripped mGBA input ELF** was also rejected when supplied
+as the supposed installed binary, directly reproducing and closing the
+mastermind's defect rather than merely checking a synthetic digest.
+The separate `PinnedCheckpointIdentityTest` adds three JVM tests proving exact
+variant pin selection, unexpected binary rejection, and rejection of a nonpinned
+file. No digest verification was bypassed or relaxed.
+
+The regression also checks compiled APK manifests with Android `aapt`:
+debug has `android:debuggable=true`, release does not, and both have
+`android:extractNativeLibs=true`. This links runtime selection via
+`FLAG_DEBUGGABLE` to the actual installed-file extraction policy, rather than
+inferring either attribute from APK filenames alone.
+
+| Post-repair verification | Result / ignored evidence |
+|---|---|
+| JVM suite | **80 tests, 0 failures, 0 errors, 0 skips** (11 suites), including three new identity tests. `app/build/test-results/testDebugUnitTest/` |
+| ARM64 APK assembly | **PASS** `:app:assembleDebug` and `:app:assembleRelease`; no APK installed. |
+| Android lint | **PASS**, 0 errors, 23 warnings. |
+| Combined Gradle | **BUILD SUCCESSFUL in 16s**, 102 tasks. `app/build/p4-c-identity-review/final-gradle.log` |
+| Source / Gradle-strip / actual APK / Java production digest match | **PASS** for debug and release, mGBA and melonDS; altered-mGBA rejection **PASS** for both. `app/build/p4-c-identity-review/production-runtime-probe.log` |
+| Real pinned-core JNI / session owner / store | **PASS** mGBA and melonDS; genuine machine/native paired capture, unsupported/mutating/oversized rejection and isolated state readback. `app/build/p4-c-identity-review/final-host-integration.log` |
+| Native-save and DS historical rollback regressions | **PASS** genuine synthetic GBA and DS save behavior and DS first/cold EEPROM recovery; older DS state demonstrably rewinds disposable EEPROM, so production historical loading remains unavailable. Same host integration log. |
+| Independent GBA SRAM first/cold process recovery | **PASS**, 32 KiB verified across fresh mGBA processes, including pre-first-frame restoration. `app/build/p4-c-identity-review/gba-native-{first,cold}.log`. |
+| Manifest integrity / symlink-safe GC / session ownership | **PASS** unchanged previous regression suites within the 80-test JVM run. |
+
+**Scope and acceptance:** recommend **ACCEPT for the narrowly repaired, host-
+verified P4-C creation milestone**, subject to mastermind review. This is not
+on-device verification of Android's native-library extraction, filesystem fsync,
+checkpoint latency, or historical-state isolation during production loading.
+Those device/runtime and P4-D gates remain **PARTIAL / NOT IMPLEMENTED** as
+previously reported. We did not access the phone, change its installed APK,
+push to GitHub, alter personal saves, build new core revisions, or expose
+historical-state loading. All new test artifacts remain ignored under
+`app/build/p4-c-identity-review/`.
+
+**Rework files:** `app/src/main/java/dev/plump/emulator/PinnedCheckpointIdentity.java`,
+`app/src/test/java/dev/plump/emulator/PinnedCheckpointIdentityTest.java`,
+`scripts/test-p4-c-packaged-core-identity.py`,
+`tests/identity/PackagedCheckpointIdentityProbe.java`, and this report.
+One local repair commit on `main` follows independent final validation;
+its exact SHA is recorded in the handoff (a commit cannot embed its own ID).
