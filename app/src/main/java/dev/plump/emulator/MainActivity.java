@@ -44,6 +44,7 @@ public final class MainActivity extends Activity {
     private Thread coreThread;
     private Thread audioThread;
     private GameSaveStore saveStore;
+    private CheckpointStore checkpointStore;
     private String gameId;
     private volatile long framesRun;
     private long lastVideoDiagnosticsMs;
@@ -131,6 +132,18 @@ public final class MainActivity extends Activity {
                     }
                 }
             });
+            checkpointStore = new CheckpointStore(new File(getFilesDir(), "checkpoints").toPath(), directory -> {
+                FileDescriptor fd = null;
+                try {
+                    fd = Os.open(directory.toAbsolutePath().toString(), OsConstants.O_RDONLY, 0);
+                    Os.fsync(fd);
+                } catch (android.system.ErrnoException exception) {
+                    throw new IOException("Checkpoint directory sync failed", exception);
+                } finally {
+                    if (fd != null) try { Os.close(fd); } catch (android.system.ErrnoException ignored) { }
+                }
+            }, path -> new android.os.StatFs(path.toString()).getAvailableBytes(),
+                    point -> { });
         } catch (IOException exception) {
             message("Native-save storage unavailable: " + exception.getMessage());
             return;
@@ -149,6 +162,34 @@ public final class MainActivity extends Activity {
                 }
                 @Override public boolean stopAndSave() { return stopLoopsAndSave(); }
                 @Override public boolean startLoops(long token) { return startOwnedLoops(token); }
+                @Override public CheckpointStore checkpointStore() { return checkpointStore; }
+                @Override public CheckpointStore.Identity checkpointIdentity() {
+                    if (gameId == null) return null;
+                    try {
+                        return PinnedCheckpointIdentity.gba(MainActivity.this, gameId,
+                                NativeCore.serializerApiVersion());
+                    } catch (IOException failure) { throw new IllegalStateException(failure); }
+                }
+                @Override public CheckpointStore.Capture captureCheckpoint() {
+                    int capabilities = NativeCore.serializerCapabilities();
+                    int apiVersion = NativeCore.serializerApiVersion();
+                    if (capabilities != PinnedCheckpointIdentity.REQUIRED_CAPABILITIES || apiVersion != 1)
+                        return CheckpointStore.Capture.unsupported(apiVersion,
+                                "Pinned mGBA serializer capability is unsupported");
+                    byte[][] captured;
+                    try { captured = NativeCore.captureCheckpoint(); }
+                    catch (OutOfMemoryError exhausted) {
+                        return CheckpointStore.Capture.unsupported(apiVersion,
+                                "Not enough memory for a bounded mGBA checkpoint capture");
+                    }
+                    if (captured == null || captured.length != 2 || captured[0] == null || captured[1] == null)
+                        return CheckpointStore.Capture.unsupported(apiVersion,
+                                "Pinned mGBA state or native SRAM capture failed validation");
+                    return CheckpointStore.Capture.supported(apiVersion, captured[0], captured[1]);
+                }
+                @Override public void checkpointFailed(String detail) {
+                    android.util.Log.w("Plump", "GBA automatic checkpoint unavailable: " + detail);
+                }
                 @Override public void unloadGame() {
                     if (nativeGameLoaded) NativeCore.unloadGame();
                     nativeGameLoaded = gameLoaded = false;

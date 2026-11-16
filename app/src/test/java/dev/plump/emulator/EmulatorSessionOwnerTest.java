@@ -357,6 +357,150 @@ public final class EmulatorSessionOwnerTest {
         assertFalse("A failed shutdown remains quarantined until process restart", owner.closeHost(token));
     }
 
+    @Test public void checkpointRequiresPausedOwnedGameAndPauseCreatesAnAutoRecord() throws Exception {
+        Path root = temporary.newFolder().toPath();
+        EmulatorSessionOwner owner = new EmulatorSessionOwner();
+        FakeHost host = new FakeHost();
+        host.checkpointStore = new CheckpointStore(root.resolve("checkpoints"));
+        host.checkpointIdentity = checkpointIdentity(GAME_A);
+        host.checkpointCapture = CheckpointStore.Capture.supported(1, new byte[]{1, 2, 3}, new byte[]{4, 5});
+        EmulatorSessionOwner.HostToken token = attach(owner, root.resolve("receipts"), EmulatorSessionOwner.Console.GBA, host);
+        assertTrue(owner.initialize(token));
+        assertTrue(open(owner, token, GAME_A).opened);
+
+        CheckpointStore.Record manual = owner.createManualCheckpoint(token);
+        assertEquals(CheckpointStore.Kind.MANUAL, manual.kind);
+        assertEquals(1, host.checkpointCaptures.get());
+        assertTrue(owner.resume(token));
+        try { owner.createManualCheckpoint(token); fail("Running session capture must be rejected"); }
+        catch (IOException expected) { assertTrue(expected.getMessage().contains("paused")); }
+        assertEquals(1, host.checkpointCaptures.get());
+
+        assertTrue(owner.pause(token));
+        assertEquals(2, host.checkpointCaptures.get());
+        List<CheckpointStore.Record> records = host.checkpointStore.listValid(host.checkpointIdentity);
+        assertEquals(1, records.stream().filter(r -> r.kind == CheckpointStore.Kind.MANUAL).count());
+        assertEquals(1, records.stream().filter(r -> r.kind == CheckpointStore.Kind.AUTO).count());
+    }
+
+    @Test public void exclusiveOwnerLockPreventsCloseDuringPausedCapture() throws Exception {
+        Path root = temporary.newFolder().toPath();
+        EmulatorSessionOwner owner = new EmulatorSessionOwner();
+        FakeHost host = new FakeHost();
+        host.checkpointStore = new CheckpointStore(root.resolve("checkpoints"));
+        host.checkpointIdentity = new CheckpointStore.Identity("ds", GAME_A, "melonds-libretro-ds",
+                "16f127dbb587a73371827ce79689c5d237c4b59b", "f394adbacb5722ee97c1b37c8064da9a25818310",
+                "83e7b9389083576d70c05466911f4796a8099bc1b43f5d56381c493c0d950c30", "arm64-v8a", 1);
+        host.checkpointCapture = CheckpointStore.Capture.supported(1, new byte[]{7}, new byte[]{8});
+        host.captureEntered = new CountDownLatch(1);
+        host.allowCapture = new CountDownLatch(1);
+        EmulatorSessionOwner.HostToken token = attach(owner, root.resolve("receipts"), EmulatorSessionOwner.Console.DS, host);
+        assertTrue(owner.initialize(token));
+        assertTrue(open(owner, token, GAME_A).opened);
+
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try {
+            Future<CheckpointStore.Record> capture = pool.submit(() -> owner.createManualCheckpoint(token));
+            assertTrue(host.captureEntered.await(2, TimeUnit.SECONDS));
+            CountDownLatch closeStarted = new CountDownLatch(1);
+            Future<Boolean> close = pool.submit(() -> { closeStarted.countDown(); return owner.closeHost(token); });
+            assertTrue(closeStarted.await(2, TimeUnit.SECONDS));
+            Thread.sleep(100);
+            assertFalse("Close waits until the session-owned capture releases the transition lock", close.isDone());
+            assertEquals(0, host.unloads.get());
+            host.allowCapture.countDown();
+            CheckpointStore.Record manual = capture.get(2, TimeUnit.SECONDS);
+            assertEquals(CheckpointStore.Kind.MANUAL, manual.kind);
+            assertTrue(close.get(2, TimeUnit.SECONDS));
+            assertEquals(1, host.unloads.get());
+            assertEquals(1, host.checkpointStore.listValid(host.checkpointIdentity).stream()
+                    .filter(r -> r.kind == CheckpointStore.Kind.MANUAL).count());
+        } finally {
+            host.allowCapture.countDown();
+            pool.shutdownNow();
+        }
+    }
+
+    @Test public void identityMismatchAndUnsupportedSerializerDoNotPublish() throws Exception {
+        Path root = temporary.newFolder().toPath();
+        EmulatorSessionOwner owner = new EmulatorSessionOwner();
+        FakeHost host = new FakeHost();
+        host.checkpointStore = new CheckpointStore(root.resolve("checkpoints"));
+        host.checkpointIdentity = checkpointIdentity(GAME_B);
+        host.checkpointCapture = CheckpointStore.Capture.supported(1, new byte[]{1}, new byte[]{2});
+        EmulatorSessionOwner.HostToken token = attach(owner, root.resolve("receipts"), EmulatorSessionOwner.Console.GBA, host);
+        assertTrue(owner.initialize(token));
+        assertTrue(open(owner, token, GAME_A).opened);
+        try { owner.createManualCheckpoint(token); fail("Wrong game identity must be rejected"); }
+        catch (IOException expected) { assertTrue(expected.getMessage().contains("identity")); }
+        assertEquals(0, host.checkpointCaptures.get());
+
+        host.checkpointIdentity = checkpointIdentity(GAME_A);
+        host.checkpointCapture = CheckpointStore.Capture.unsupported(1, "pinned core has no serializer");
+        try { owner.createManualCheckpoint(token); fail("Unsupported serializer must fail closed"); }
+        catch (IOException expected) { assertTrue(expected.getMessage().contains("no serializer")); }
+        assertTrue(host.checkpointStore.listValid(host.checkpointIdentity).isEmpty());
+    }
+
+    @Test public void failedAutomaticCheckpointDoesNotUndoDurablePauseOrNativeSave() throws Exception {
+        Path root = temporary.newFolder().toPath();
+        EmulatorSessionOwner owner = new EmulatorSessionOwner();
+        FakeHost host = new FakeHost();
+        host.checkpointStore = new CheckpointStore(root.resolve("checkpoints"), CheckpointStoreTest::sync,
+                path -> Long.MAX_VALUE, point -> {
+                    if (point == CheckpointStore.FaultPoint.AFTER_TEMP_WRITE) throw new IOException("injected disk error");
+                });
+        host.checkpointIdentity = checkpointIdentity(GAME_A);
+        host.checkpointCapture = CheckpointStore.Capture.supported(1, new byte[]{1}, new byte[]{2});
+        EmulatorSessionOwner.HostToken token = attach(owner, root.resolve("receipts"), EmulatorSessionOwner.Console.GBA, host);
+        assertTrue(owner.initialize(token));
+        assertTrue(open(owner, token, GAME_A).opened);
+        assertTrue(owner.resume(token));
+        assertTrue(owner.pause(token));
+        assertEquals(1, host.successfulSaves.get());
+        assertTrue(host.checkpointFailure.contains("injected disk error"));
+        assertEquals(SessionReceiptStore.State.PAUSED,
+                owner.readReceipt(EmulatorSessionOwner.Console.GBA, GAME_A).state);
+        assertTrue(owner.resume(token));
+    }
+
+    @Test public void repeatedGameSwitchesKeepManualAndAutomaticRecordsIndependent() throws Exception {
+        Path root = temporary.newFolder().toPath();
+        EmulatorSessionOwner owner = new EmulatorSessionOwner();
+        FakeHost host = new FakeHost();
+        host.checkpointStore = new CheckpointStore(root.resolve("checkpoints"));
+        host.checkpointIdentity = checkpointIdentity(GAME_A);
+        host.checkpointCapture = CheckpointStore.Capture.supported(1, new byte[]{1}, new byte[]{2});
+        EmulatorSessionOwner.HostToken token = attach(owner, root.resolve("receipts"), EmulatorSessionOwner.Console.GBA, host);
+        assertTrue(owner.initialize(token));
+        assertTrue(open(owner, token, GAME_A).opened);
+        CheckpointStore.Record manualA = owner.createManualCheckpoint(token);
+        assertTrue(owner.resume(token));
+        assertTrue(owner.open(token, GAME_B, new EmulatorSessionOwner.GameLoader() {
+            @Override public String loadAndRestore() { host.checkpointIdentity = checkpointIdentity(GAME_B); return null; }
+            @Override public void discardFailedLoad() { }
+        }).opened);
+        CheckpointStore.Record manualB = owner.createManualCheckpoint(token);
+        assertTrue(owner.resume(token));
+        assertTrue(owner.open(token, GAME_A, new EmulatorSessionOwner.GameLoader() {
+            @Override public String loadAndRestore() { host.checkpointIdentity = checkpointIdentity(GAME_A); return null; }
+            @Override public void discardFailedLoad() { }
+        }).opened);
+        assertTrue(owner.resume(token));
+        assertTrue(owner.pause(token));
+
+        List<CheckpointStore.Record> gameA = host.checkpointStore.listValid(checkpointIdentity(GAME_A));
+        List<CheckpointStore.Record> gameB = host.checkpointStore.listValid(checkpointIdentity(GAME_B));
+        assertEquals(manualA.id, gameA.stream().filter(r -> r.kind == CheckpointStore.Kind.MANUAL)
+                .findFirst().orElseThrow().id);
+        assertEquals(manualB.id, gameB.stream().filter(r -> r.kind == CheckpointStore.Kind.MANUAL)
+                .findFirst().orElseThrow().id);
+        assertTrue(gameA.stream().anyMatch(r -> r.kind == CheckpointStore.Kind.AUTO));
+        assertTrue(gameB.stream().anyMatch(r -> r.kind == CheckpointStore.Kind.AUTO));
+        assertFalse(gameA.stream().anyMatch(r -> r.identity.romSha256.equals(GAME_B)));
+        assertFalse(gameB.stream().anyMatch(r -> r.identity.romSha256.equals(GAME_A)));
+    }
+
     private EmulatorSessionOwner.HostToken attach(EmulatorSessionOwner owner, Path root,
                                                    EmulatorSessionOwner.Console console, FakeHost host) {
         return owner.attach(console, host, new SessionReceiptStore(root));
@@ -376,6 +520,13 @@ public final class EmulatorSessionOwnerTest {
         return new String(bytes);
     }
 
+    private static CheckpointStore.Identity checkpointIdentity(String gameId) {
+        return new CheckpointStore.Identity("gba", gameId, "mgba-libretro",
+                "d58ea8a86f30598fbf3958585de3d33028535072", "none",
+                "05c9a63ed92b9dee8ac802992d9852c02a03515dd99b42d8b654b03434db4429",
+                "arm64-v8a", 1);
+    }
+
     private static final class FakeHost implements EmulatorSessionOwner.Host {
         final AtomicInteger initializations = new AtomicInteger();
         final AtomicInteger starts = new AtomicInteger();
@@ -393,6 +544,13 @@ public final class EmulatorSessionOwnerTest {
         volatile CountDownLatch allowStart;
         volatile CountDownLatch stopEntered;
         volatile CountDownLatch allowStop;
+        final AtomicInteger checkpointCaptures = new AtomicInteger();
+        volatile CheckpointStore checkpointStore;
+        volatile CheckpointStore.Identity checkpointIdentity;
+        volatile CheckpointStore.Capture checkpointCapture = CheckpointStore.Capture.unsupported(1, "not configured");
+        volatile CountDownLatch captureEntered;
+        volatile CountDownLatch allowCapture;
+        volatile String checkpointFailure;
 
         @Override public boolean initializeCore() {
             initializations.incrementAndGet();
@@ -433,6 +591,16 @@ public final class EmulatorSessionOwnerTest {
             if (failShutdown) throw new IllegalStateException("injected shutdown failure");
             shutdowns.incrementAndGet();
         }
+
+        @Override public CheckpointStore checkpointStore() { return checkpointStore; }
+        @Override public CheckpointStore.Identity checkpointIdentity() { return checkpointIdentity; }
+        @Override public CheckpointStore.Capture captureCheckpoint() {
+            checkpointCaptures.incrementAndGet();
+            if (captureEntered != null) captureEntered.countDown();
+            await(allowCapture);
+            return checkpointCapture;
+        }
+        @Override public void checkpointFailed(String message) { checkpointFailure = message; }
 
         private static void await(CountDownLatch latch) {
             if (latch == null) return;

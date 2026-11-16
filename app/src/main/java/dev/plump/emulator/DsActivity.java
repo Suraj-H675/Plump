@@ -11,6 +11,7 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.os.SystemClock;
 import android.system.Os;
+import android.system.OsConstants;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.SurfaceHolder;
@@ -49,6 +50,7 @@ public final class DsActivity extends Activity {
     private Button pauseButton, expandButton;
     private TextView status;
     private GameSaveStore saveStore;
+    private CheckpointStore checkpointStore;
     private String gameId;
     private long frames, lastStats;
     private boolean coreReady, loaded, nativeGameLoaded, userPaused, foreground, enlarged;
@@ -229,6 +231,17 @@ public final class DsActivity extends Activity {
                     if (fd != null) try { Os.close(fd); } catch (android.system.ErrnoException ignored) { }
                 }
             });
+            checkpointStore = new CheckpointStore(new File(getFilesDir(), "checkpoints").toPath(), directory -> {
+                FileDescriptor fd = null;
+                try {
+                    fd = Os.open(directory.toAbsolutePath().toString(), OsConstants.O_RDONLY, 0);
+                    Os.fsync(fd);
+                } catch (android.system.ErrnoException failure) {
+                    throw new IOException("Checkpoint directory sync failed", failure);
+                } finally {
+                    if (fd != null) try { Os.close(fd); } catch (android.system.ErrnoException ignored) { }
+                }
+            }, path -> new android.os.StatFs(path.toString()).getAvailableBytes(), point -> { });
             hostToken = sessionOwner.attach(EmulatorSessionOwner.Console.DS, new EmulatorSessionOwner.Host() {
                 @Override public boolean initializeCore() {
                     if (NativeDs.LOAD_ERROR != null) {
@@ -242,6 +255,34 @@ public final class DsActivity extends Activity {
                 }
                 @Override public boolean stopAndSave() { return DsActivity.this.stopAndSave(); }
                 @Override public boolean startLoops(long token) { return startOwnedLoops(token); }
+                @Override public CheckpointStore checkpointStore() { return checkpointStore; }
+                @Override public CheckpointStore.Identity checkpointIdentity() {
+                    if (gameId == null) return null;
+                    try {
+                        return PinnedCheckpointIdentity.ds(DsActivity.this, gameId,
+                                NativeDs.serializerApiVersion());
+                    } catch (IOException failure) { throw new IllegalStateException(failure); }
+                }
+                @Override public CheckpointStore.Capture captureCheckpoint() {
+                    int capabilities = NativeDs.serializerCapabilities();
+                    int apiVersion = NativeDs.serializerApiVersion();
+                    if (capabilities != PinnedCheckpointIdentity.REQUIRED_CAPABILITIES || apiVersion != 1)
+                        return CheckpointStore.Capture.unsupported(apiVersion,
+                                "Pinned melonDS serializer capability is unsupported");
+                    byte[][] captured;
+                    try { captured = NativeDs.captureCheckpoint(); }
+                    catch (OutOfMemoryError exhausted) {
+                        return CheckpointStore.Capture.unsupported(apiVersion,
+                                "Not enough memory for a bounded melonDS checkpoint capture");
+                    }
+                    if (captured == null || captured.length != 2 || captured[0] == null || captured[1] == null)
+                        return CheckpointStore.Capture.unsupported(apiVersion,
+                                "Pinned melonDS state or cartridge EEPROM capture failed validation");
+                    return CheckpointStore.Capture.supported(apiVersion, captured[0], captured[1]);
+                }
+                @Override public void checkpointFailed(String detail) {
+                    android.util.Log.w("Plump", "DS automatic checkpoint unavailable: " + detail);
+                }
                 @Override public void unloadGame() {
                     if (nativeGameLoaded) NativeDs.unload();
                     nativeGameLoaded = loaded = false;

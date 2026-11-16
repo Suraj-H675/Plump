@@ -15,6 +15,12 @@ final class EmulatorSessionOwner {
         boolean startLoops(long runToken);
         void unloadGame();
         void shutdownCore();
+        default CheckpointStore checkpointStore() { return null; }
+        default CheckpointStore.Identity checkpointIdentity() { return null; }
+        default CheckpointStore.Capture captureCheckpoint() {
+            return CheckpointStore.Capture.unsupported(0, "Checkpoint serializer unavailable");
+        }
+        default void checkpointFailed(String message) { }
     }
 
     interface GameLoader {
@@ -272,8 +278,9 @@ final class EmulatorSessionOwner {
             }
             synchronized (this) {
                 session.phase = Phase.PAUSED;
-                if (exclusiveConsole == token.console) exclusiveConsole = null;
             }
+            maybeCreateAutoCheckpoint(entry, session);
+            synchronized (this) { if (exclusiveConsole == token.console) exclusiveConsole = null; }
             return true;
         } finally {
             transitions.unlock();
@@ -302,6 +309,7 @@ final class EmulatorSessionOwner {
                 try { stopped = entry.host.stopAndSave(); }
                 catch (RuntimeException failure) { stopped = false; }
                 if (!stopped) { markRecovery(session, ownsActiveSlot); return false; }
+                if (ownsActiveSlot) maybeCreateAutoCheckpoint(entry, session);
                 try { entry.host.unloadGame(); }
                 catch (RuntimeException failure) { markRecovery(session, ownsActiveSlot); return false; }
             }
@@ -346,6 +354,27 @@ final class EmulatorSessionOwner {
         }
     }
 
+    CheckpointStore.Record createManualCheckpoint(HostToken token) throws IOException {
+        transitions.lock();
+        try {
+            HostEntry entry = currentHost(token);
+            Session session = sessionFor(token);
+            if (entry == null || session == null || !entry.initialized)
+                throw new IOException("No current loaded session for checkpoint capture");
+            synchronized (this) {
+                if (session.phase != Phase.PAUSED || exclusiveConsole != null)
+                    throw new IOException("Checkpoint capture requires the exclusive paused session");
+                exclusiveConsole = token.console;
+            }
+            try { return createCheckpoint(entry, session, CheckpointStore.Kind.MANUAL); }
+            finally {
+                synchronized (this) { if (exclusiveConsole == token.console) exclusiveConsole = null; }
+            }
+        } finally {
+            transitions.unlock();
+        }
+    }
+
     private boolean stopAndPublishPaused(HostEntry entry, Session session) {
         synchronized (this) {
             session.phase = Phase.QUIESCING;
@@ -359,9 +388,39 @@ final class EmulatorSessionOwner {
         catch (IOException failure) { markRecovery(session, true); return false; }
         synchronized (this) {
             session.phase = Phase.PAUSED;
-            if (exclusiveConsole == session.console) exclusiveConsole = null;
         }
+        maybeCreateAutoCheckpoint(entry, session);
+        synchronized (this) { if (exclusiveConsole == session.console) exclusiveConsole = null; }
         return true;
+    }
+
+    private void maybeCreateAutoCheckpoint(HostEntry entry, Session session) {
+        try { createCheckpoint(entry, session, CheckpointStore.Kind.AUTO); }
+        catch (IOException | RuntimeException failure) {
+            try { entry.host.checkpointFailed(failure.getMessage()); }
+            catch (RuntimeException ignored) { }
+        }
+    }
+
+    private CheckpointStore.Record createCheckpoint(HostEntry entry, Session session,
+                                                     CheckpointStore.Kind kind) throws IOException {
+        CheckpointStore.Identity identity;
+        CheckpointStore store;
+        CheckpointStore.Capture capture;
+        try {
+            identity = entry.host.checkpointIdentity();
+            store = entry.host.checkpointStore();
+        } catch (RuntimeException failure) {
+            throw new IOException("Checkpoint host identity or storage is unavailable", failure);
+        }
+        if (identity == null || store == null)
+            throw new IOException("Checkpoint storage identity is unavailable");
+        String expectedConsole = session.console == Console.GBA ? "gba" : "ds";
+        if (!expectedConsole.equals(identity.console) || !session.gameId.equals(identity.romSha256))
+            throw new IOException("Checkpoint identity does not match the owned game session");
+        try { capture = entry.host.captureCheckpoint(); }
+        catch (RuntimeException failure) { throw new IOException("Checkpoint serializer capture failed", failure); }
+        return store.create(identity, capture, kind, session.runToken);
     }
 
     private boolean publish(Session session, SessionReceiptStore.State state) throws IOException {

@@ -27,6 +27,10 @@ using Audio = void (*)(int16_t, int16_t);
 using AudioBatch = size_t (*)(const int16_t*, size_t);
 using Poll = void (*)();
 using Input = int16_t (*)(unsigned, unsigned, unsigned, unsigned);
+using SerializeSize = size_t (*)();
+using Serialize = bool (*)(void*, size_t);
+using Unserialize = bool (*)(const void*, size_t);
+using ApiVersion = unsigned (*)();
 
 struct Api {
     void* handle = nullptr;
@@ -44,6 +48,10 @@ struct Api {
     void (*avInfo)(AvInfo*) = nullptr;
     void* (*memoryData)(unsigned) = nullptr;
     size_t (*memorySize)(unsigned) = nullptr;
+    SerializeSize serializeSize = nullptr;
+    Serialize serialize = nullptr;
+    Unserialize unserialize = nullptr;
+    ApiVersion apiVersion = nullptr;
 };
 
 Api api;
@@ -276,6 +284,10 @@ Java_dev_plump_emulator_NativeDs_initialize(JNIEnv* env, jclass, jstring system,
         symbol(api.memoryData, "retro_get_memory_data") &&
         symbol(api.memorySize, "retro_get_memory_size");
     if (!okay) { dlclose(api.handle); api = {}; return problem(env, "Missing melonDS Libretro symbol"); }
+    symbol(api.serializeSize, "retro_serialize_size");
+    symbol(api.serialize, "retro_serialize");
+    symbol(api.unserialize, "retro_unserialize");
+    symbol(api.apiVersion, "retro_api_version");
     registerCallbacks();
     api.init();
     needsCoreReset = false;
@@ -327,6 +339,82 @@ Java_dev_plump_emulator_NativeDs_snapshot(JNIEnv* env, jclass) {
     jbyteArray result = env->NewByteArray(static_cast<jsize>(size));
     if (result) env->SetByteArrayRegion(result, 0, static_cast<jsize>(size), static_cast<jbyte*>(data));
     return result;
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_dev_plump_emulator_NativeDs_serializerCapabilities(JNIEnv*, jclass) {
+    std::lock_guard<std::mutex> lock(coreMutex);
+    return (api.serializeSize ? 1 : 0) | (api.serialize ? 2 : 0) |
+           (api.unserialize ? 4 : 0) | (api.apiVersion ? 8 : 0);
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_dev_plump_emulator_NativeDs_serializerApiVersion(JNIEnv*, jclass) {
+    std::lock_guard<std::mutex> lock(coreMutex);
+    return api.apiVersion ? static_cast<jint>(api.apiVersion()) : -1;
+}
+
+extern "C" JNIEXPORT jobjectArray JNICALL
+Java_dev_plump_emulator_NativeDs_captureCheckpoint(JNIEnv* env, jclass) {
+    std::lock_guard<std::mutex> lock(coreMutex);
+    constexpr size_t MAX_MACHINE_BYTES = 64 * 1024 * 1024;
+    constexpr size_t MAX_NATIVE_BYTES = 1024 * 1024;
+    if (!loaded || !api.serializeSize || !api.serialize || !api.unserialize ||
+            !api.apiVersion || api.apiVersion() != 1) return nullptr;
+
+    const size_t stateSize = api.serializeSize();
+    const size_t nativeSize = api.memorySize(0);
+    void* nativeData = api.memoryData(0);
+    if (stateSize == 0 || stateSize > MAX_MACHINE_BYTES ||
+            nativeSize == 0 || nativeSize > MAX_NATIVE_BYTES || !nativeData) return nullptr;
+
+    try {
+        std::vector<uint8_t> state(stateSize);
+        std::vector<uint8_t> nativeSave(nativeSize);
+        std::memcpy(nativeSave.data(), nativeData, nativeSize);
+        if (!api.serialize(state.data(), state.size())) return nullptr;
+
+        const size_t afterSize = api.memorySize(0);
+        void* afterData = api.memoryData(0);
+        if (!afterData || afterSize != nativeSize ||
+                std::memcmp(afterData, nativeSave.data(), nativeSize) != 0) {
+            if (afterData && afterSize == nativeSize)
+                std::memcpy(afterData, nativeSave.data(), nativeSize);
+            return nullptr;
+        }
+
+        jbyteArray stateArray = env->NewByteArray(static_cast<jsize>(stateSize));
+        if (!stateArray) return nullptr;
+        env->SetByteArrayRegion(stateArray, 0, static_cast<jsize>(stateSize),
+                                reinterpret_cast<const jbyte*>(state.data()));
+        if (env->ExceptionCheck()) { env->DeleteLocalRef(stateArray); return nullptr; }
+        jbyteArray nativeArray = env->NewByteArray(static_cast<jsize>(nativeSize));
+        if (!nativeArray) { env->DeleteLocalRef(stateArray); return nullptr; }
+        env->SetByteArrayRegion(nativeArray, 0, static_cast<jsize>(nativeSize),
+                                reinterpret_cast<const jbyte*>(nativeSave.data()));
+        if (env->ExceptionCheck()) {
+            env->DeleteLocalRef(stateArray);
+            env->DeleteLocalRef(nativeArray);
+            return nullptr;
+        }
+        jclass byteArrayClass = env->FindClass("[B");
+        if (!byteArrayClass) {
+            env->DeleteLocalRef(stateArray);
+            env->DeleteLocalRef(nativeArray);
+            return nullptr;
+        }
+        jobjectArray result = env->NewObjectArray(2, byteArrayClass, nullptr);
+        env->DeleteLocalRef(byteArrayClass);
+        if (result) {
+            env->SetObjectArrayElement(result, 0, stateArray);
+            env->SetObjectArrayElement(result, 1, nativeArray);
+        }
+        env->DeleteLocalRef(stateArray);
+        env->DeleteLocalRef(nativeArray);
+        return env->ExceptionCheck() ? nullptr : result;
+    } catch (const std::bad_alloc&) {
+        return nullptr;
+    }
 }
 extern "C" JNIEXPORT jint JNICALL
 Java_dev_plump_emulator_NativeDs_saveSize(JNIEnv*, jclass) {

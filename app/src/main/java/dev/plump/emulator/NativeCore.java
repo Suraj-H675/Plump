@@ -21,6 +21,9 @@ final class NativeCore {
     static native String initialize();
     static native String loadGame(byte[] rom);
     static native void runFrame();
+    static native int serializerCapabilities();
+    static native int serializerApiVersion();
+    static native byte[][] captureCheckpoint();
     static native byte[] snapshotSaveRam();
     static String restoreSaveRam(byte[] bytes) {
         if (bytes == null) return "No saved SRAM data";

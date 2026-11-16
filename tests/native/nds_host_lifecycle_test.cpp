@@ -16,6 +16,7 @@
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <utility>
 #include <vector>
 
 struct ANativeWindow {
@@ -66,10 +67,43 @@ extern "C" int __android_log_print(int, const char*, const char*, ...) { return 
 #include "../../app/src/main/cpp/nds_host.cpp"
 #endif
 
+#ifndef PLUMP_TEST_OLD_ADAPTER
+extern "C" JNIEXPORT jobjectArray JNICALL
+Java_dev_plump_emulator_HostCheckpointProbe_captureDs(JNIEnv* env, jclass) {
+    return Java_dev_plump_emulator_NativeDs_captureCheckpoint(env, nullptr);
+}
+extern "C" JNIEXPORT jobjectArray JNICALL
+Java_dev_plump_emulator_HostCheckpointProbe_captureGba(JNIEnv*, jclass) { return nullptr; }
+#endif
+
 static std::vector<uint8_t> readFile(const char* path) {
     std::ifstream stream(path, std::ios::binary);
     assert(stream);
     return {std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
+}
+static void runOwnerCheckpointProbe(JNIEnv* env, const char* method, const char* root,
+                                    const char* romSha, const char* hostSha) {
+    jclass probe = env->FindClass("dev/plump/emulator/HostCheckpointProbe");
+    assert(probe && !env->ExceptionCheck());
+    JNINativeMethod captureMethods[] = {
+        {const_cast<char*>("captureGba"), const_cast<char*>("()[[B"),
+         reinterpret_cast<void*>(Java_dev_plump_emulator_HostCheckpointProbe_captureGba)},
+        {const_cast<char*>("captureDs"), const_cast<char*>("()[[B"),
+         reinterpret_cast<void*>(Java_dev_plump_emulator_HostCheckpointProbe_captureDs)},
+    };
+    assert(env->RegisterNatives(probe, captureMethods, 2) == JNI_OK);
+    jmethodID entry = env->GetStaticMethodID(probe, method,
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V");
+    assert(entry && !env->ExceptionCheck());
+    jstring rootArg = env->NewStringUTF(root);
+    jstring romArg = env->NewStringUTF(romSha);
+    jstring coreArg = env->NewStringUTF(hostSha);
+    env->CallStaticVoidMethod(probe, entry, rootArg, romArg, coreArg);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); std::abort(); }
+    env->DeleteLocalRef(rootArg);
+    env->DeleteLocalRef(romArg);
+    env->DeleteLocalRef(coreArg);
+    env->DeleteLocalRef(probe);
 }
 static jbyteArray bytes(JNIEnv* env, const std::vector<uint8_t>& value) {
     jbyteArray out = env->NewByteArray(static_cast<jsize>(value.size()));
@@ -99,6 +133,24 @@ static std::vector<uint8_t> snapshot(JNIEnv* env) {
     assert(!env->ExceptionCheck());
     return data;
 }
+#ifndef PLUMP_TEST_OLD_ADAPTER
+static std::pair<std::vector<uint8_t>, std::vector<uint8_t>> checkpointCapture(JNIEnv* env) {
+    jobjectArray result = Java_dev_plump_emulator_NativeDs_captureCheckpoint(env, nullptr);
+    assert(result && env->GetArrayLength(result) == 2);
+    std::vector<uint8_t> arrays[2];
+    for (jsize index = 0; index < 2; ++index) {
+        auto value = static_cast<jbyteArray>(env->GetObjectArrayElement(result, index));
+        assert(value);
+        const jsize length = env->GetArrayLength(value);
+        arrays[index].resize(static_cast<size_t>(length));
+        env->GetByteArrayRegion(value, 0, length, reinterpret_cast<jbyte*>(arrays[index].data()));
+        env->DeleteLocalRef(value);
+    }
+    env->DeleteLocalRef(result);
+    assert(!env->ExceptionCheck());
+    return {std::move(arrays[0]), std::move(arrays[1])};
+}
+#endif
 static void load(JNIEnv* env, const std::vector<uint8_t>& rom) {
     jbyteArray data = bytes(env, rom);
     std::string error = consume(env, Java_dev_plump_emulator_NativeDs_load(env, nullptr, data));
@@ -147,8 +199,10 @@ int main(int argc, char** argv) {
     std::string errorFile = std::string("-XX:ErrorFile=") +
                             (std::getenv("PLUMP_JVM_ERROR_FILE") ?
                              std::getenv("PLUMP_JVM_ERROR_FILE") : "/tmp/plump-host-hs_err_pid%p.log");
-    JavaVMOption vmOption{errorFile.data(), nullptr};
-    JavaVMInitArgs vmArgs{JNI_VERSION_1_8, 1, &vmOption, JNI_FALSE};
+    const char* classPath = argc == 8 ? argv[5] : nullptr;
+    std::string classPathOption = classPath ? std::string("-Djava.class.path=") + classPath : std::string();
+    JavaVMOption vmOptions[] = {{errorFile.data(), nullptr}, {classPathOption.data(), nullptr}};
+    JavaVMInitArgs vmArgs{JNI_VERSION_1_8, classPath ? 2 : 1, vmOptions, JNI_FALSE};
     assert(JNI_CreateJavaVM(&vm, reinterpret_cast<void**>(&env), &vmArgs) == JNI_OK);
     if (argc == 2 && std::strcmp(argv[1], "--missing-symbols") == 0) {
         jstring sys = env->NewStringUTF("/tmp/test-only-system");
@@ -166,7 +220,52 @@ int main(int argc, char** argv) {
         std::puts("PASS: partial initialization rejects missing symbols, remains retryable");
         return 0;
     }
+#ifndef PLUMP_TEST_OLD_ADAPTER
+    if (argc == 2 && std::strcmp(argv[1], "--unsupported-serializer") == 0) {
+        jstring sys = env->NewStringUTF("/tmp/test-only-system");
+        jstring saves = env->NewStringUTF("/tmp/test-only-saves");
+        assert(!consume(env, Java_dev_plump_emulator_NativeDs_initialize(env, nullptr, sys, saves)).size());
+        assert(Java_dev_plump_emulator_NativeDs_serializerCapabilities(env, nullptr) == 0);
+        assert(Java_dev_plump_emulator_NativeDs_serializerApiVersion(env, nullptr) == -1);
+        load(env, std::vector<uint8_t>(512, 0));
+        assert(Java_dev_plump_emulator_NativeDs_saveSize(env, nullptr) == 16);
+        assert(!Java_dev_plump_emulator_NativeDs_captureCheckpoint(env, nullptr));
+        Java_dev_plump_emulator_NativeDs_unload(env, nullptr);
+        Java_dev_plump_emulator_NativeDs_shutdown(env, nullptr);
+        env->DeleteLocalRef(sys);
+        env->DeleteLocalRef(saves);
+        assert(vm->DestroyJavaVM() == JNI_OK);
+        std::puts("PASS melonDS unsupported serializer: frontend remains usable and capture is rejected");
+        return 0;
+    }
+    if (argc == 2 && (std::strcmp(argv[1], "--mutating-serializer") == 0 ||
+                      std::strcmp(argv[1], "--oversized-serializer") == 0)) {
+        const bool oversized = std::strcmp(argv[1], "--oversized-serializer") == 0;
+        jstring sys = env->NewStringUTF("/tmp/test-only-system");
+        jstring saves = env->NewStringUTF("/tmp/test-only-saves");
+        assert(!consume(env, Java_dev_plump_emulator_NativeDs_initialize(env, nullptr, sys, saves)).size());
+        assert(Java_dev_plump_emulator_NativeDs_serializerCapabilities(env, nullptr) == 15);
+        assert(Java_dev_plump_emulator_NativeDs_serializerApiVersion(env, nullptr) == 1);
+        load(env, std::vector<uint8_t>(512, 0));
+        const auto before = snapshot(env);
+        assert(before.size() == 16);
+        assert(!Java_dev_plump_emulator_NativeDs_captureCheckpoint(env, nullptr));
+        assert(snapshot(env) == before);
+        Java_dev_plump_emulator_NativeDs_unload(env, nullptr);
+        Java_dev_plump_emulator_NativeDs_shutdown(env, nullptr);
+        env->DeleteLocalRef(sys);
+        env->DeleteLocalRef(saves);
+        assert(vm->DestroyJavaVM() == JNI_OK);
+        std::printf("PASS melonDS %s capture: rejected without changing native save RAM\n",
+                    oversized ? "oversized" : "mutating-serializer");
+        return 0;
+    }
+#endif
+#ifdef PLUMP_TEST_OLD_ADAPTER
     assert(argc == 5 && "usage: HOST_TEST DS_INPUT_NDS DS_EEPROM_NDS EEPROM_BASELINE_8192 WORKDIR");
+#else
+    assert(argc == 8 && "usage: HOST_TEST DS_INPUT_NDS DS_EEPROM_NDS EEPROM_BASELINE_8192 WORKDIR PROBE_CLASSES ROM_SHA HOST_CORE_SHA");
+#endif
     std::string root(argv[4]);
     const auto input = readFile(argv[1]);
     const auto eeprom = readFile(argv[2]);
@@ -182,6 +281,11 @@ int main(int argc, char** argv) {
     Java_dev_plump_emulator_NativeDs_topSurface(env, nullptr, top);
     Java_dev_plump_emulator_NativeDs_bottomSurface(env, nullptr, bottom);
 
+#ifndef PLUMP_TEST_OLD_ADAPTER
+    assert(Java_dev_plump_emulator_NativeDs_serializerCapabilities(env, nullptr) == 15);
+    assert(Java_dev_plump_emulator_NativeDs_serializerApiVersion(env, nullptr) == 1);
+    assert(!Java_dev_plump_emulator_NativeDs_captureCheckpoint(env, nullptr));
+#endif
     load(env, input);                        // first game, callbacks and surfaces
     frames(env, 90, true);
     Java_dev_plump_emulator_NativeDs_unload(env, nullptr);
@@ -199,6 +303,20 @@ int main(int argc, char** argv) {
     assert(consume(env, Java_dev_plump_emulator_NativeDs_restore(env, nullptr, saveArray)).empty());
     env->DeleteLocalRef(saveArray);
     assert(snapshot(env) == saved);          // native restore before a single frame
+#ifndef PLUMP_TEST_OLD_ADAPTER
+    const auto nativeBeforeCapture = snapshot(env);
+    const auto checkpointA = checkpointCapture(env);
+    const auto checkpointB = checkpointCapture(env);
+    assert(checkpointA.first.size() == 19228045);
+    assert(checkpointA.first == checkpointB.first);
+    assert(checkpointA.second == saved && checkpointA.second == checkpointB.second);
+    assert(snapshot(env) == nativeBeforeCapture);
+    std::printf("PASS JNI CHECKPOINT: melonDS API v1 state=%zu bytes native=%zu bytes stable twice; EEPROM unchanged\n",
+                checkpointA.first.size(), checkpointA.second.size());
+    const std::string checkpointRoot = root + "/real-owner-checkpoints";
+    runOwnerCheckpointProbe(env, "runDs", checkpointRoot.c_str(), argv[6], argv[7]);
+    assert(snapshot(env) == nativeBeforeCapture);
+#endif
     frames(env, 90, false);                  // EEPROM diagnostic without pressing A
     assert(snapshot(env) == saved);
     Java_dev_plump_emulator_NativeDs_unload(env, nullptr);

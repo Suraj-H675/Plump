@@ -20,6 +20,9 @@ final class NativeDs {
     static native String initialize(String privateSystemDir, String privateSaveDir);
     static native String load(byte[] rom);
     static native void frame();
+    static native int serializerCapabilities();
+    static native int serializerApiVersion();
+    static native byte[][] captureCheckpoint();
     static native int saveSize();
     static native byte[] snapshot();
     static native String restore(byte[] save);
