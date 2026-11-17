@@ -273,6 +273,7 @@ public final class DsActivity extends Activity {
                 @Override public CheckpointStore checkpointStore() { return checkpointStore; }
                 @Override public HistoricalBranchStore historicalBranchStore() { return branchStore; }
                 @Override public ActiveTimelineStore activeTimelineStore() { return timelineStore; }
+                @Override public GameSaveStore canonicalGameSaveStore() { return saveStore; }
                 @Override public EmulatorSessionOwner.RestoreDisposition restoreHistoricalBranch(
                         HistoricalBranchStore.Branch branch) { return restoreBranch(branch); }
                 @Override public CheckpointStore.Identity checkpointIdentity() {

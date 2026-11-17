@@ -9,16 +9,21 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InterruptedIOException;
 import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.FileSystemException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.Locale;
+import java.util.Map;
 
 /**
  * Two independently checksummed generations of *native cartridge SRAM*.
@@ -90,6 +95,25 @@ public final class GameSaveStore {
         }
     }
 
+    /** Exact raw PLSV file set used only by the explicit native-save promotion anchor. */
+    static final class PromotionImage {
+        final byte[] nativeBytes;
+        final long generation;
+        final String nativeSha256;
+        final Map<String, byte[]> files;
+
+        PromotionImage(byte[] nativeBytes, long generation, String nativeSha256,
+                       Map<String, byte[]> files) {
+            this.nativeBytes = nativeBytes.clone();
+            this.generation = generation;
+            this.nativeSha256 = nativeSha256;
+            LinkedHashMap<String, byte[]> copy = new LinkedHashMap<>();
+            for (Map.Entry<String, byte[]> entry : files.entrySet())
+                copy.put(entry.getKey(), entry.getValue() == null ? null : entry.getValue().clone());
+            this.files = Collections.unmodifiableMap(copy);
+        }
+    }
+
     private static final class Record {
         final int slot;
         final long generation;
@@ -130,6 +154,7 @@ public final class GameSaveStore {
     private final File directory;
     private final DirectorySync directorySync;
     private final FailureInjector failureInjector;
+    private final ThreadLocal<FailureInjector> writeObserver = new ThreadLocal<>();
 
     public GameSaveStore(File directory, DirectorySync directorySync) throws IOException {
         this(directory, directorySync, ignored -> {});
@@ -156,6 +181,79 @@ public final class GameSaveStore {
         return new File(directory, gameId + ".history");
     }
 
+    File storageDirectory() { return directory.toPath().toAbsolutePath().normalize().toFile(); }
+
+    /**
+     * Captures the current fully verified native generation and every PLSV v1 file byte-for-byte.
+     * This stricter view rejects damaged/absent receipts and invalid present slots; it is not used
+     * by ordinary game loading, whose older-good-generation recovery behavior is unchanged.
+     */
+    synchronized PromotionImage snapshotForPromotion(String gameId) throws IOException {
+        validateGameId(gameId);
+        if (hasUnsafePaths(gameId) || hasSymlinkComponent(directory.toPath().toAbsolutePath().normalize()))
+            throw new IOException("Canonical PLSV contains an unsafe path");
+        Scan scan = scan(gameId);
+        if (scan.hasInvalidFile())
+            throw new IOException("Canonical PLSV contains an invalid generation; promotion refused");
+        if (!hasValidHistoryReceipt(gameId))
+            throw new IOException("Canonical PLSV history receipt is unavailable or invalid");
+        Record newest = scan.newest();
+        if (newest == null)
+            throw new IOException("Canonical native save is not available for promotion");
+        LinkedHashMap<String, byte[]> files = new LinkedHashMap<>();
+        for (int index = 0; index < 2; index++) {
+            File file = slot(gameId, index);
+            files.put(file.getName(), file.exists() ? readNoFollow(file.toPath(), MAX_LENGTH + HEADER_LENGTH) : null);
+        }
+        File receipt = historyReceipt(gameId);
+        files.put(receipt.getName(), receipt.exists() ? readNoFollow(receipt.toPath(), HISTORY_LENGTH) : null);
+        if (files.get(receipt.getName()) == null)
+            throw new IOException("Canonical PLSV history receipt is missing");
+        return new PromotionImage(newest.bytes, newest.generation,
+                hex(sha256(newest.bytes)), files);
+    }
+
+    private static boolean hasSymlinkComponent(Path path) {
+        Path current = path.getRoot();
+        if (current == null) return false;
+        for (Path component : path) {
+            current = current.resolve(component);
+            if (Files.isSymbolicLink(current)) return true;
+        }
+        return false;
+    }
+
+    private static byte[] readNoFollow(Path path, int limit) throws IOException {
+        if (Files.isSymbolicLink(path) || !Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS))
+            throw new IOException("PLSV promotion file is not a safe regular file");
+        long size = Files.size(path);
+        if (size < 0 || size > limit || size > Integer.MAX_VALUE)
+            throw new IOException("PLSV promotion file exceeds its size bound");
+        ByteBuffer data = ByteBuffer.allocate((int) size);
+        try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS)) {
+            while (data.hasRemaining()) {
+                int count = channel.read(data);
+                if (count < 0) throw new IOException("PLSV promotion file was truncated during readback");
+            }
+            if (channel.read(ByteBuffer.allocate(1)) != -1 || Files.size(path) != size)
+                throw new IOException("PLSV promotion file changed during readback");
+        }
+        return data.array();
+    }
+
+    synchronized boolean matchesPromotionImage(String gameId, PromotionImage expected) throws IOException {
+        if (expected == null) return false;
+        PromotionImage actual;
+        try { actual = snapshotForPromotion(gameId); }
+        catch (IOException invalid) { return false; }
+        if (actual.generation != expected.generation || !actual.nativeSha256.equals(expected.nativeSha256) ||
+                !Arrays.equals(actual.nativeBytes, expected.nativeBytes) ||
+                !actual.files.keySet().equals(expected.files.keySet())) return false;
+        for (String name : actual.files.keySet())
+            if (!Arrays.equals(actual.files.get(name), expected.files.get(name))) return false;
+        return true;
+    }
+
     /** Rejects paths that would make PLSV validation follow substituted or non-regular files. */
     synchronized boolean hasUnsafePaths(String gameId) {
         validateGameId(gameId);
@@ -175,6 +273,12 @@ public final class GameSaveStore {
     private static byte[] sha256(byte[] bytes) {
         try { return MessageDigest.getInstance("SHA-256").digest(bytes); }
         catch (NoSuchAlgorithmException exception) { throw new AssertionError(exception); }
+    }
+
+    private static String hex(byte[] bytes) {
+        StringBuilder output = new StringBuilder(bytes.length * 2);
+        for (byte value : bytes) output.append(String.format(Locale.ROOT, "%02x", value & 255));
+        return output.toString();
     }
 
     private static byte[] gameDigest(String gameId) {
@@ -297,6 +401,16 @@ public final class GameSaveStore {
         if (!validReceipt) publishHistoryReceipt(gameId);
     }
 
+    /** Promotion-only observation point; it does not change the PLSV v1 write protocol. */
+    synchronized void writeForPromotion(String gameId, byte[] bytes, FailureInjector observer)
+            throws IOException {
+        if (observer == null) throw new IOException("Promotion PLSV observer is unavailable");
+        if (writeObserver.get() != null) throw new IOException("Nested promotion PLSV write is unsupported");
+        writeObserver.set(observer);
+        try { write(gameId, bytes); }
+        finally { writeObserver.remove(); }
+    }
+
     private static int chooseTargetSlot(Scan scan, long generation) {
         if (scan.first != null && scan.second != null)
             return scan.first.generation <= scan.second.generation ? scan.first.slot : scan.second.slot;
@@ -405,6 +519,8 @@ public final class GameSaveStore {
     private void inject(WritePoint point, FailureReason fallback) throws SaveFailure {
         try {
             failureInjector.at(point);
+            FailureInjector observer = writeObserver.get();
+            if (observer != null) observer.at(point);
         } catch (IOException exception) {
             throw asFailure(exception, fallback);
         }

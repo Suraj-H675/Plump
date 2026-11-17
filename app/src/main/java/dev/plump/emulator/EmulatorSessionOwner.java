@@ -18,10 +18,15 @@ final class EmulatorSessionOwner {
         default CheckpointStore checkpointStore() { return null; }
         default CheckpointStore.Identity checkpointIdentity() { return null; }
         default ActiveTimelineStore activeTimelineStore() { return null; }
+        default GameSaveStore canonicalGameSaveStore() { return null; }
         default CheckpointStore.Capture captureCheckpoint() {
             return CheckpointStore.Capture.unsupported(0, "Checkpoint serializer unavailable");
         }
         default HistoricalBranchStore historicalBranchStore() { return null; }
+        default NativeSavePromotionStore.NativeSaveMode nativeSavePromotionMode() {
+            return NativeSavePromotionStore.NativeSaveMode.UNKNOWN;
+        }
+        default void nativeSavePromotionCommitted() { }
         default RestoreDisposition restoreHistoricalBranch(HistoricalBranchStore.Branch branch) {
             return RestoreDisposition.FAILED;
         }
@@ -60,6 +65,56 @@ final class EmulatorSessionOwner {
         }
     }
 
+    /** Unforgeable, short-lived proof that the owner holds its transition lock for a paused branch. */
+    static final class PromotionLease {
+        private final EmulatorSessionOwner owner;
+        private final long hostValue;
+        private final long sessionId;
+        private final Console console;
+        private final String gameId;
+        private final String branchId;
+        private boolean active = true;
+
+        private PromotionLease(EmulatorSessionOwner owner, HostToken host, Session session) {
+            this.owner = owner;
+            hostValue = host.value;
+            sessionId = session.id;
+            console = session.console;
+            gameId = session.gameId;
+            branchId = session.branchId;
+        }
+
+        boolean isValid(CheckpointStore.Identity identity, String expectedBranchId) {
+            return owner.validPromotionLease(this, identity, expectedBranchId);
+        }
+
+        long sessionId() { return sessionId; }
+        String branchId() { return branchId; }
+    }
+
+    static final class PromotionContext {
+        final CheckpointStore.Identity identity;
+        final NativeSavePromotionStore.NativeSaveMode mode;
+        final GameSaveStore canonical;
+        final HistoricalBranchStore branches;
+        final ActiveTimelineStore timelines;
+
+        PromotionContext(CheckpointStore.Identity identity,
+                         NativeSavePromotionStore.NativeSaveMode mode,
+                         GameSaveStore canonical, HistoricalBranchStore branches,
+                         ActiveTimelineStore timelines) {
+            this.identity = identity;
+            this.mode = mode;
+            this.canonical = canonical;
+            this.branches = branches;
+            this.timelines = timelines;
+        }
+    }
+
+    interface PromotionAction<T> {
+        T run(PromotionLease lease, PromotionContext context) throws IOException;
+    }
+
     static final class OpenResult {
         final boolean opened;
         final String error;
@@ -75,6 +130,7 @@ final class EmulatorSessionOwner {
     private enum Phase { PAUSED, RUNNING, QUIESCING, RECOVERY_REQUIRED }
 
     private static final class Session {
+        final long id;
         final Console console;
         final String gameId;
         Phase phase;
@@ -82,6 +138,7 @@ final class EmulatorSessionOwner {
         String branchId;
 
         Session(Console console, String gameId, Phase phase) {
+            this.id = IDS.incrementAndGet();
             this.console = console;
             this.gameId = gameId;
             this.phase = phase;
@@ -174,6 +231,147 @@ final class EmulatorSessionOwner {
         return store == null
                 ? new SessionReceiptStore.ReadResult(SessionReceiptStore.State.UNKNOWN, null, false)
                 : store.read(toReceiptConsole(console), gameId);
+    }
+
+    NativeSavePromotionStore.Proposal proposeNativeSavePromotion(HostToken token) throws IOException {
+        return withPausedBranch(token, null, (lease, context) -> context.timelines.promotions()
+                .propose(lease, context.identity, context.mode, context.canonical, context.branches));
+    }
+
+    NativeSavePromotionStore.Approval approveNativeSavePromotion(HostToken token,
+            NativeSavePromotionStore.Proposal proposal, String explicitConfirmation) throws IOException {
+        if (proposal == null) throw new IOException("Promotion proposal is unavailable");
+        return withPausedBranch(token, proposal.branchId, (lease, context) -> context.timelines.promotions()
+                .approve(lease, proposal, explicitConfirmation, context.identity, context.mode,
+                        context.canonical, context.branches));
+    }
+
+    NativeSavePromotionStore.Result promoteNativeSaveBranch(HostToken token,
+            NativeSavePromotionStore.Approval approval) throws IOException {
+        if (approval == null) throw new IOException("Promotion approval is unavailable");
+        NativeSavePromotionStore.Result completed = retryCommittedPromotion(token, approval);
+        if (completed != null) return completed;
+        return withPausedBranch(token, approval.branchId, (lease, context) -> {
+            NativeSavePromotionStore.Result result = context.timelines.promotions().promote(
+                    lease, approval, context.identity, context.mode, context.canonical, context.branches);
+            if (result.classification == NativeSavePromotionStore.Classification.COMMITTED) {
+                HostEntry entry = currentHost(token);
+                Session session = sessionFor(token);
+                if (entry == null || session == null || !approval.branchId.equals(session.branchId))
+                    throw new IOException("Promotion committed after the owned branch session changed");
+                try { entry.host.nativeSavePromotionCommitted(); }
+                catch (RuntimeException failure) {
+                    markRecovery(session, true);
+                    throw new IOException("Promotion committed, but the paused host could not adopt canonical saves", failure);
+                }
+                synchronized (this) {
+                    // The loaded core still contains the branch session's in-memory state.
+                    // Retire this host without another save; a fresh cold-open must use canonical.
+                    session.phase = Phase.RECOVERY_REQUIRED;
+                    entry.failedShutdown = true;
+                    exclusiveConsole = token.console;
+                }
+            }
+            return result;
+        });
+    }
+
+    private NativeSavePromotionStore.Result retryCommittedPromotion(HostToken token,
+            NativeSavePromotionStore.Approval approval) throws IOException {
+        transitions.lock();
+        try {
+            HostEntry entry = currentHost(token);
+            Session session = sessionFor(token);
+            if (entry == null || session == null || !entry.failedShutdown ||
+                    session.phase != Phase.RECOVERY_REQUIRED || !approval.branchId.equals(session.branchId))
+                return null;
+            ActiveTimelineStore timelines;
+            GameSaveStore canonical;
+            HistoricalBranchStore branches;
+            CheckpointStore.Identity identity;
+            try {
+                timelines = entry.host.activeTimelineStore();
+                canonical = entry.host.canonicalGameSaveStore();
+                branches = entry.host.historicalBranchStore();
+                identity = entry.host.checkpointIdentity();
+            }
+            catch (RuntimeException unavailable) { throw new IOException("Promotion selector is unavailable", unavailable); }
+            if (timelines == null || canonical == null || branches == null || identity == null) return null;
+            return timelines.promotions().retryCommitted(approval, identity, canonical, branches);
+        } finally { transitions.unlock(); }
+    }
+
+    private <T> T withPausedBranch(HostToken token, String requiredBranch,
+                                   PromotionAction<T> action) throws IOException {
+        if (action == null) throw new IOException("Promotion action is unavailable");
+        transitions.lock();
+        PromotionLease lease = null;
+        Session session = null;
+        try {
+            HostEntry entry = currentHost(token);
+            session = sessionFor(token);
+            if (entry == null || session == null || !entry.initialized || entry.failedLoadCleanup ||
+                    entry.failedShutdown)
+                throw new IOException("A live owned game session is required for promotion");
+            synchronized (this) {
+                if (session.phase != Phase.PAUSED || exclusiveConsole != null || session.branchId == null)
+                    throw new IOException("Promotion requires the exclusive paused historical branch");
+                if (requiredBranch != null && !requiredBranch.equals(session.branchId))
+                    throw new IOException("Promotion branch no longer matches the owned session");
+                exclusiveConsole = token.console;
+            }
+            CheckpointStore.Identity identity;
+            ActiveTimelineStore timelines;
+            HistoricalBranchStore branches;
+            GameSaveStore canonical;
+            NativeSavePromotionStore.NativeSaveMode mode;
+            try {
+                identity = entry.host.checkpointIdentity();
+                timelines = entry.host.activeTimelineStore();
+                branches = entry.host.historicalBranchStore();
+                canonical = entry.host.canonicalGameSaveStore();
+                mode = entry.host.nativeSavePromotionMode();
+            } catch (RuntimeException unavailable) {
+                throw new IOException("Promotion host identity or storage is unavailable", unavailable);
+            }
+            if (identity == null || !identity.romSha256.equals(session.gameId) || timelines == null ||
+                    branches == null || canonical == null || mode == null)
+                throw new IOException("Promotion host identity or native storage is incomplete");
+            String expectedConsole = session.console == Console.GBA ? "gba" : "ds";
+            if (!expectedConsole.equals(identity.console))
+                throw new IOException("Promotion console does not match the owned game session");
+            HistoricalBranchStore.Branch branch = branches.open(session.branchId, identity);
+            ActiveTimelineStore.PromotionSelection selection = timelines.promotionSelection(identity);
+            if (selection.timeline != ActiveTimelineStore.Timeline.BRANCH ||
+                    !session.branchId.equals(selection.branchId) || !branch.id.equals(selection.branchId))
+                throw new IOException("Durable selector no longer owns the paused branch");
+            lease = new PromotionLease(this, token, session);
+            return action.run(lease, new PromotionContext(identity, mode, canonical, branches, timelines));
+        } catch (IOException failure) {
+            throw failure;
+        } catch (RuntimeException failure) {
+            throw new IOException("Native-save promotion failed closed", failure);
+        } finally {
+            if (lease != null) lease.active = false;
+            synchronized (this) {
+                if (token != null && exclusiveConsole == token.console) exclusiveConsole = null;
+            }
+            transitions.unlock();
+        }
+    }
+
+    private boolean validPromotionLease(PromotionLease lease, CheckpointStore.Identity identity,
+                                       String expectedBranchId) {
+        if (lease == null || identity == null || !transitions.isHeldByCurrentThread() ||
+                lease.owner != this || !lease.active || lease.gameId == null ||
+                !lease.gameId.equals(identity.romSha256) || !lease.branchId.equals(expectedBranchId)) return false;
+        synchronized (this) {
+            HostEntry host = hosts.get(lease.console);
+            Session session = sessions.get(lease.console);
+            return exclusiveConsole == lease.console && host != null && host.token.value == lease.hostValue &&
+                    session != null && session.id == lease.sessionId && session.phase == Phase.PAUSED &&
+                    lease.gameId.equals(session.gameId) && lease.branchId.equals(session.branchId);
+        }
     }
 
     OpenResult open(HostToken token, String gameId, GameLoader loader) {

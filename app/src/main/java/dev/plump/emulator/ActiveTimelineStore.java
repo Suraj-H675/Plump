@@ -36,7 +36,7 @@ final class ActiveTimelineStore {
     enum Timeline { CANONICAL, BRANCH }
     enum Classification {
         CANONICAL, BRANCH_NATIVE_ONLY, POTENTIAL_EXACT_STATE, ROM_UNAVAILABLE,
-        MISSING_POINTER, CORRUPT_POINTER, AMBIGUOUS, INVALID_TARGET
+        MISSING_POINTER, CORRUPT_POINTER, AMBIGUOUS, INVALID_TARGET, RECOVERY_REQUIRED
     }
 
     enum FaultPoint {
@@ -193,22 +193,54 @@ final class ActiveTimelineStore {
         }
     }
 
+    static final class PromotionSelection {
+        final Timeline timeline;
+        final String branchId;
+        final String sourceCheckpointId;
+        final long selectorGeneration;
+        final String selectorTransactionId;
+        final long nativeGeneration;
+        final String nativeSha256;
+
+        PromotionSelection(Entry entry) {
+            timeline = entry.timeline;
+            branchId = entry.branchId;
+            sourceCheckpointId = entry.sourceCheckpointId;
+            selectorGeneration = entry.generation;
+            selectorTransactionId = entry.transactionId;
+            nativeGeneration = entry.nativeGeneration;
+            nativeSha256 = entry.nativeSha256;
+        }
+    }
+
     private final Path directory;
     private final DirectorySync directorySync;
     private final FaultInjector faults;
+    private final NativeSavePromotionStore promotions;
     private CheckpointStore.Identity recoveryIdentity;
 
     ActiveTimelineStore(Path directory, DirectorySync directorySync) {
-        this(directory, directorySync, NO_FAULTS);
+        this(directory, directorySync, NO_FAULTS, null);
     }
 
     ActiveTimelineStore(Path directory, DirectorySync directorySync, FaultInjector faults) {
+        this(directory, directorySync, faults, null);
+    }
+
+    ActiveTimelineStore(Path directory, DirectorySync directorySync, FaultInjector faults,
+                        NativeSavePromotionStore.FaultInjector promotionFaults) {
         if (directory == null || directorySync == null || faults == null)
             throw new IllegalArgumentException("Timeline storage dependencies are required");
         this.directory = directory.toAbsolutePath().normalize();
         this.directorySync = directorySync;
         this.faults = faults;
+        this.promotions = promotionFaults == null ? new NativeSavePromotionStore(
+                this.directory.resolve("native-save-promotions"), this, directorySync) :
+                new NativeSavePromotionStore(this.directory.resolve("native-save-promotions"), this,
+                        directorySync, promotionFaults);
     }
+
+    NativeSavePromotionStore promotions() { return promotions; }
 
     /** Resolve before any ROM is passed to a native load/restore function. */
     synchronized Resolution resolveCold(boolean romAvailable, CheckpointStore.Identity identity,
@@ -222,6 +254,11 @@ final class ActiveTimelineStore {
         if (read.corrupt)
             return unresolved(Classification.CORRUPT_POINTER,
                     "Active timeline metadata is unreadable; choose a preserved history explicitly");
+        try { promotions.assertUnblocked(identity); }
+        catch (IOException pending) {
+            return unresolved(Classification.RECOVERY_REQUIRED,
+                    "Native-save promotion is pending or corrupt; explicit recovery is required");
+        }
         if (read.absent) {
             HistoricalBranchStore.Evidence evidence = branches.scanPublishedEvidence(identity);
             if (evidence == HistoricalBranchStore.Evidence.MATCHING_ROM)
@@ -283,6 +320,7 @@ final class ActiveTimelineStore {
     /** Internal explicit choice. It publishes PREPARED, revalidates the native target, then COMMITTED. */
     synchronized SelectionResult selectCanonical(CheckpointStore.Identity identity,
                                                  GameSaveStore canonical) throws IOException {
+        promotions.assertUnblocked(identity);
         Entry target = canonicalTarget(identity, canonical);
         return select(target, canonical);
     }
@@ -290,6 +328,7 @@ final class ActiveTimelineStore {
     /** Explicit recovery choice; prior selector bytes are moved intact into durable evidence first. */
     synchronized SelectionResult recoverCanonical(CheckpointStore.Identity identity,
                                                   GameSaveStore canonical) throws IOException {
+        promotions.assertUnblocked(identity);
         Entry target = canonicalTarget(identity, canonical);
         return recoverSelection(target, canonical);
     }
@@ -298,6 +337,7 @@ final class ActiveTimelineStore {
     synchronized SelectionResult recoverBranch(CheckpointStore.Identity identity,
                                                 HistoricalBranchStore branches,
                                                 HistoricalBranchStore.Branch branch) throws IOException {
+        promotions.assertUnblocked(identity);
         Entry target = branchTarget(identity, branches, branch);
         HistoricalBranchStore.Branch verified = branches.open(branch.id, identity);
         return recoverSelection(target, verified.saves);
@@ -305,6 +345,7 @@ final class ActiveTimelineStore {
 
     synchronized PendingSelection prepareCanonical(CheckpointStore.Identity identity,
                                                     GameSaveStore canonical) throws IOException {
+        promotions.assertUnblocked(identity);
         if (identity == null || canonical == null) throw new IOException("Canonical selection identity is incomplete");
         GameSaveStore.Recovery nativeSave = verifiedTarget(canonical, identity);
         return prepare(new Entry(1, State.PREPARED, UUID.randomUUID().toString(), identity,
@@ -316,6 +357,7 @@ final class ActiveTimelineStore {
     synchronized SelectionResult selectBranch(CheckpointStore.Identity identity,
                                                HistoricalBranchStore branches,
                                                HistoricalBranchStore.Branch branch) throws IOException {
+        promotions.assertUnblocked(identity);
         PendingSelection pending = prepareBranch(identity, branches, branch);
         return commit(pending);
     }
@@ -323,6 +365,7 @@ final class ActiveTimelineStore {
     synchronized PendingSelection prepareBranch(CheckpointStore.Identity identity,
                                                   HistoricalBranchStore branches,
                                                   HistoricalBranchStore.Branch branch) throws IOException {
+        promotions.assertUnblocked(identity);
         Entry target = branchTarget(identity, branches, branch);
         HistoricalBranchStore.Branch verified = branches.open(branch.id, identity);
         return prepare(target, verified.saves);
@@ -331,6 +374,7 @@ final class ActiveTimelineStore {
     synchronized SelectionResult commit(PendingSelection pending) throws IOException {
         if (pending == null || pending.targetStore == null)
             throw new IOException("Prepared timeline selection is incomplete");
+        promotions.assertUnblocked(pending.identity);
         Entry prepared = pending.entry();
         return commitPrepared(prepared, pending.targetStore);
     }
@@ -338,6 +382,7 @@ final class ActiveTimelineStore {
     /** Called before any core save write. It proves the committed selector still owns the target journal. */
     synchronized void assertWritable(CheckpointStore.Identity identity, String branchId,
                                      GameSaveStore target) throws IOException {
+        promotions.assertUnblocked(identity);
         Entry entry = requireCommitted(identity);
         requireTimeline(entry, branchId);
         requireNative(target, identity, entry.nativeGeneration, entry.nativeSha256);
@@ -346,6 +391,7 @@ final class ActiveTimelineStore {
     /** Called after every durable PLSV write; publishes and verifies the new selector generation. */
     synchronized SelectionResult recordDurableSave(CheckpointStore.Identity identity, String branchId,
                                                    GameSaveStore target, byte[] written) throws IOException {
+        promotions.assertUnblocked(identity);
         Entry current = requireCommitted(identity);
         requireTimeline(current, branchId);
         GameSaveStore.Recovery latest = verifiedTarget(target, identity);
@@ -356,6 +402,50 @@ final class ActiveTimelineStore {
         Entry prepared = current.with(1, State.PREPARED, latest.generation,
                 sha256(latest.bytes), transaction);
         return select(prepared, target);
+    }
+
+    synchronized PromotionSelection promotionSelection(CheckpointStore.Identity identity) throws IOException {
+        if (identity == null) throw new IOException("Promotion selector identity is unavailable");
+        Read read = read(identity);
+        if (read.corrupt || read.latest == null || read.latest.state != State.COMMITTED)
+            throw new IOException("Promotion requires a committed active selector");
+        return new PromotionSelection(read.latest);
+    }
+
+    /**
+     * The sole selector path allowed through a pending promotion gate. The promotion store
+     * revalidates the durable intent, branch, target PLSV generation and transaction scope.
+     */
+    synchronized SelectionResult selectCanonicalForPromotion(CheckpointStore.Identity identity,
+                                                              GameSaveStore canonical,
+                                                              String selectorTransactionId,
+                                                              String promotionTransactionId,
+                                                              String branchId) throws IOException {
+        promotions.authorizeSelectorCommit(identity, canonical, promotionTransactionId, branchId);
+        GameSaveStore.Recovery nativeSave = requireNative(canonical, identity,
+                verifiedTarget(canonical, identity).generation,
+                verifiedTarget(canonical, identity).bytes == null ? NONE :
+                        sha256(verifiedTarget(canonical, identity).bytes));
+        Entry target = new Entry(1, State.PREPARED, selectorTransactionId, identity,
+                Timeline.CANONICAL, NONE, NONE, nativeSave.generation,
+                nativeSave.bytes == null ? NONE : sha256(nativeSave.bytes), NONE, 0, NONE);
+        Read current = readRaw(identity);
+        if (!current.corrupt && current.latest != null && current.latest.state == State.COMMITTED &&
+                current.latest.timeline == Timeline.CANONICAL &&
+                current.latest.transactionId.equals(selectorTransactionId) &&
+                sameSelection(current.latest, target))
+            return new SelectionResult(true, Timeline.CANONICAL, null,
+                    nativeSave.generation, target.nativeSha256, null);
+        if (!current.corrupt && current.latest != null && current.latest.state == State.PREPARED &&
+                current.latest.transactionId.equals(selectorTransactionId) &&
+                sameSelection(current.latest, target))
+            return commitPrepared(current.latest, canonical);
+        if (current.corrupt || (current.latest != null && current.latest.state == State.AMBIGUOUS))
+            return recoverSelection(target, canonical);
+        if (current.latest != null && current.latest.state == State.PREPARED)
+            return recoverSelection(target, canonical);
+        PendingSelection pending = prepare(target, canonical);
+        return commitPrepared(pending.entry(), canonical);
     }
 
     /** Ambiguity is durable when possible; a hard kill already leaves PREPARED as a fail-closed marker. */
