@@ -17,6 +17,8 @@ import sys
 ROOT = Path(__file__).resolve().parents[2]
 HOST_CORE = ROOT / "app/build/p3-melonds-host/src/libretro/melondsds_libretro.so"
 CORE_SHA = "e8c5fd156e9d1fe9fa861cd93cc0ef25ddc7eecb0ccf65a6a6a8c4695e577616"
+E1B_ROM_ROOT = Path(os.environ.get(
+    "PLUMP_E1B_ROM_ROOT", str(ROOT / "app/build/p4-e1-b")))
 GAMES = {
     "upstream-memory": (
         ROOT / "app/build/p3-melonds-source/test/nds/tests_sys_mem_regions.nds",
@@ -24,7 +26,14 @@ GAMES = {
     "cc0-input": (
         ROOT / "app/build/p3-input-diagnostic/p3_input_diagnostic.nds",
         "109b7c302ade948e73b8b52081c37a380d8f1ea6a4c1be2cee062e1cd304482d"),
+    "plump-alpha": (
+        E1B_ROM_ROOT / "rom-alpha/plump_e1b_alpha.nds",
+        "1dbbf7e6dea0068a4495b5d3fff5d20f61b099ba48bf9fc0dc0512b136c40588"),
+    "plump-beta": (
+        E1B_ROM_ROOT / "rom-beta/plump_e1b_beta.nds",
+        "e01a1934e49732c6266bef6b51e64ae74ae5d0d5a426d802cf311f29854823e5"),
 }
+WRITER_GAMES = {"plump-alpha", "plump-beta"}
 IMAGE_LEN = 128 * 1024 * 1024
 MAX_PER_FILE = 160 * 1024 * 1024
 
@@ -64,6 +73,12 @@ def run_once(run_root, game_key, frames, readonly=False, hard_stop=False):
     if not 1 <= frames <= 360:
         raise ValueError("Unbounded or empty frame count")
     rom_path, expected_rom_sha = GAMES[game_key]
+    if game_key in WRITER_GAMES:
+        writer_root = (ROOT / "app/build/p4-e1-b").resolve(strict=True)
+        actual_rom = rom_path.resolve(strict=True)
+        if (not actual_rom.is_relative_to(writer_root) or
+                rom_path.is_symlink() or actual_rom.suffix != ".nds"):
+            raise ValueError("E1-B diagnostic ROM must be a nonsymlink ignored fixture")
     if not rom_path.is_file() or digest(rom_path) != expected_rom_sha:
         raise ValueError("Licensed disposable ROM has unknown bytes")
     if digest(HOST_CORE) != CORE_SHA:
@@ -104,6 +119,7 @@ def run_once(run_root, game_key, frames, readonly=False, hard_stop=False):
     paths = {9: os.fsencode(system), 30: os.fsencode(system), 31: os.fsencode(save)}
     seen = set()
     rendered = [0]
+    last_frame = [None]
 
     @Environment
     def environment(command, pointer):
@@ -136,6 +152,9 @@ def run_once(run_root, game_key, frames, readonly=False, hard_stop=False):
     def video(data, width, height, pitch):
         if data and width == 256 and height == 384:
             rendered[0] += 1
+            if game_key in WRITER_GAMES:
+                last_frame[0] = (width, height, pitch,
+                                 ct.string_at(data, pitch * height))
 
     @Audio
     def audio(left, right):
@@ -189,6 +208,18 @@ def run_once(run_root, game_key, frames, readonly=False, hard_stop=False):
     if not {"melonds_homebrew_sdcard", "melonds_homebrew_sync_sdcard_to_host",
             "melonds_homebrew_readonly"}.issubset(seen):
         raise AssertionError("Pinned core never requested E1 experimental DLDI options")
+    if game_key in WRITER_GAMES and rendered[0] == 0:
+        raise AssertionError("Plump DLDI diagnostic did not render a DS frame")
+    if last_frame[0] is not None:
+        width, height, pitch, pixels = last_frame[0]
+        (root / "last-frame.xrgb8888").write_bytes(pixels)
+        (root / "last-frame.json").write_text(json.dumps({
+            "pixel_format": "XRGB8888",
+            "width": width,
+            "height": height,
+            "pitch": pitch,
+            "bytes": len(pixels),
+        }, indent=2, sort_keys=True) + "\n")
     result = {
         "case": game_key,
         "core_sha256": CORE_SHA,
@@ -205,7 +236,9 @@ def run_once(run_root, game_key, frames, readonly=False, hard_stop=False):
         "index_bytes": index.stat().st_size if index.is_file() else None,
         "folder_sync_directory_present": (target.parent / "dldi_sd_card").exists(),
         "requested_options": sorted(seen),
-        "proof_type": "pinned-core-homebrew-boot-not-genuine-in-game-FAT-write",
+        "proof_type": ("pinned-core-homebrew-execution-only; independently inspect "
+                       "PLUMP record/report files for genuine writer proof"),
+        "diagnostic_frame_captured": last_frame[0] is not None,
     }
     (root / "result.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
     print("P4_E1_HOST_BOOT", json.dumps(result, sort_keys=True), flush=True)
@@ -215,7 +248,7 @@ if __name__ == "__main__":
     if len(sys.argv) not in (4, 5) or sys.argv[2] not in GAMES or (
         len(sys.argv) == 5 and sys.argv[4] not in ("readonly", "hard-stop")
     ):
-        raise SystemExit("usage: verify-p4-e1-virtual-sd.py IGNORED_RUN_DIR upstream-memory|cc0-input FRAMES [readonly|hard-stop]")
+        raise SystemExit("usage: verify-p4-e1-virtual-sd.py IGNORED_RUN_DIR upstream-memory|cc0-input|plump-alpha|plump-beta FRAMES [readonly|hard-stop]")
     run_once(Path(sys.argv[1]), sys.argv[2], int(sys.argv[3]),
              len(sys.argv) == 5 and sys.argv[4] == "readonly",
              len(sys.argv) == 5 and sys.argv[4] == "hard-stop")
