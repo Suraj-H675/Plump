@@ -1,0 +1,805 @@
+diff --git a/src/FATStorage.cpp b/src/FATStorage.cpp
+index c9dbe7db..99cf49dc 100644
+--- a/src/FATStorage.cpp
++++ b/src/FATStorage.cpp
+@@ -19,6 +19,7 @@
+ #include <string.h>
+ #include <dirent.h>
+ #include <inttypes.h>
++#include <cstdlib>
+ #include <vector>
+ 
+ #include "FATIO.h"
+@@ -31,13 +32,16 @@ namespace fs = std::filesystem;
+ using namespace Platform;
+ using std::string;
+ 
+-FATStorage::FATStorage(const std::string& filename, u64 size, bool readonly, const std::optional<string>& sourcedir) :
+-    FATStorage(FATStorageArgs { filename, size, readonly, sourcedir })
++FATStorage::FATStorage(const std::string& filename, u64 size, bool readonly,
++                       const std::optional<string>& sourcedir, bool requireExisting,
++                       bool formatIfInvalid) :
++    FATStorage(FATStorageArgs { filename, size, readonly, sourcedir, requireExisting, formatIfInvalid })
+ {
+ }
+ 
+ FATStorage::FATStorage(const FATStorageArgs& args) noexcept :
+-    FATStorage(args.Filename, args.Size, args.ReadOnly, args.SourceDir)
++    FATStorage(args.Filename, args.Size, args.ReadOnly, args.SourceDir,
++               args.RequireExisting, args.FormatIfInvalid)
+ {
+ }
+ 
+@@ -45,6 +49,8 @@ FATStorage::FATStorage(FATStorageArgs&& args) noexcept :
+     FilePath(std::move(args.Filename)),
+     FileSize(args.Size),
+     ReadOnly(args.ReadOnly),
++    RequireExisting(args.RequireExisting),
++    FormatIfInvalid(args.FormatIfInvalid),
+     SourceDir(std::move(args.SourceDir))
+ {
+     Load(FilePath, FileSize, SourceDir);
+@@ -56,35 +62,39 @@ FATStorage::FATStorage(FATStorage&& other) noexcept
+     IndexPath = std::move(other.IndexPath);
+     SourceDir = std::move(other.SourceDir);
+     ReadOnly = other.ReadOnly;
++    RequireExisting = other.RequireExisting;
++    FormatIfInvalid = other.FormatIfInvalid;
+     File = other.File;
+     FileSize = other.FileSize;
++    Status = other.Status;
+     DirIndex = std::move(other.DirIndex);
+     FileIndex = std::move(other.FileIndex);
+ 
+     other.File = nullptr;
++    other.Status.State = static_cast<u32>(FATStorageState::Closed);
+ }
+ 
+ FATStorage& FATStorage::operator=(FATStorage&& other) noexcept
+ {
+     if (this != &other)
+     {
+-        if (File)
+-        { // Sync this file's contents to the host (if applicable) before closing it
+-            if (!ReadOnly) Save();
+-            CloseFile(File);
+-        }
++        Close();
+ 
+         FilePath = std::move(other.FilePath);
+         IndexPath = std::move(other.IndexPath);
+         SourceDir = std::move(other.SourceDir);
+         ReadOnly = other.ReadOnly;
++        RequireExisting = other.RequireExisting;
++        FormatIfInvalid = other.FormatIfInvalid;
+         File = other.File;
+         FileSize = other.FileSize;
++        Status = other.Status;
+         DirIndex = std::move(other.DirIndex);
+         FileIndex = std::move(other.FileIndex);
+ 
+         other.File = nullptr;
+         other.SourceDir = std::nullopt;
++        other.Status.State = static_cast<u32>(FATStorageState::Closed);
+     }
+ 
+     return *this;
+@@ -92,15 +102,61 @@ FATStorage& FATStorage::operator=(FATStorage&& other) noexcept
+ 
+ FATStorage::~FATStorage()
+ {
+-    if (!ReadOnly) Save();
++    Close();
++}
++
++void FATStorage::MarkError(FATStorageError error, FRESULT fatResult) noexcept
++{
++    const u32 value = static_cast<u32>(error);
++    if (value == static_cast<u32>(FATStorageError::None)) return;
++    if (Status.FirstError == static_cast<u32>(FATStorageError::None))
++        Status.FirstError = value;
++    Status.LastError = value;
++    Status.LastFatResult = static_cast<u32>(fatResult);
++    Status.State = static_cast<u32>(FATStorageState::Failed);
++}
+ 
+-    if (File) CloseFile(File);
++bool FATStorage::Close() noexcept
++{
++    if (!File)
++    {
++        Status.State = static_cast<u32>(FATStorageState::Closed);
++        return Status.FirstError == static_cast<u32>(FATStorageError::None);
++    }
++
++    bool okay = true;
++    if (!ReadOnly && SourceDir && !Save()) okay = false;
++
++    // filestream_flush only drains the frontend stream to its OS layer. It is
++    // deliberately not described as fsync or as a durable image checkpoint.
++    if (!ReadOnly && Status.Dirty)
++    {
++        Status.FlushAttempted = 1;
++        const char* failFlush = std::getenv("PLUMP_E2_FAIL_STREAM_FLUSH");
++        Status.FlushSucceeded = (!failFlush || failFlush[0] != '1') && FileFlush(File) ? 1 : 0;
++        if (!Status.FlushSucceeded)
++        {
++            MarkError(FATStorageError::StreamFlushFailed);
++            okay = false;
++        }
++    }
++
++    Status.CloseAttempted = 1;
++    const bool closed = CloseFile(File);
++    Status.CloseSucceeded = closed ? 1 : 0;
+     File = nullptr;
++    if (!closed)
++    {
++        MarkError(FATStorageError::CloseFailed);
++        okay = false;
++    }
++    Status.State = static_cast<u32>(FATStorageState::Closed);
++    return okay && Status.FirstError == static_cast<u32>(FATStorageError::None);
+ }
+ 
+ bool FATStorage::InjectFile(const std::string& path, u8* data, u32 len)
+ {
+-    if (!File) return false;
++    if (!IsReady()) return false;
+ 
+     ff_disk_open(FF_ReadStorage(), FF_WriteStorage(), (LBA_t)(FileSize>>9));
+ 
+@@ -110,6 +166,7 @@ bool FATStorage::InjectFile(const std::string& path, u8* data, u32 len)
+     res = f_mount(&fs, "0:", 1);
+     if (res != FR_OK)
+     {
++        MarkError(FATStorageError::MountFailed, res);
+         f_unmount("0:");
+         ff_disk_close();
+         return false;
+@@ -121,18 +178,24 @@ bool FATStorage::InjectFile(const std::string& path, u8* data, u32 len)
+     res = f_open(&file, prefixedPath.c_str(), FA_CREATE_ALWAYS | FA_WRITE);
+     if (res != FR_OK)
+     {
++        MarkError(FATStorageError::InjectFailed, res);
+         f_unmount("0:");
+         ff_disk_close();
+         return false;
+     }
+ 
+-    u32 nwrite;
+-    f_write(&file, data, len, &nwrite);
+-    f_close(&file);
++    u32 nwrite = 0;
++    res = f_write(&file, data, len, &nwrite);
++    const FRESULT closeResult = f_close(&file);
+ 
+     f_unmount("0:");
+     ff_disk_close();
+-    return nwrite==len;
++    if (res != FR_OK || nwrite != len || closeResult != FR_OK)
++    {
++        MarkError(FATStorageError::InjectFailed, res != FR_OK ? res : closeResult);
++        return false;
++    }
++    return true;
+ }
+ 
+ u32 FATStorage::ReadFile(const std::string& path, u32 start, u32 len, u8* data)
+@@ -173,15 +236,52 @@ u32 FATStorage::ReadFile(const std::string& path, u32 start, u32 len, u8* data)
+     return nread;
+ }
+ 
+-u32 FATStorage::ReadSectors(u32 start, u32 num, u8* data) const
++u32 FATStorage::ReadSectors(u32 start, u32 num, u8* data)
+ {
+-    return ReadSectorsInternal(File, FileSize, start, num, data);
++    ++Status.DldiReadCalls;
++    if (!IsReady())
++    {
++        ++Status.DldiReadFailures;
++        return 0;
++    }
++    const u32 result = ReadSectorsInternal(File, FileSize, start, num, data);
++    if (result != num) ++Status.DldiReadFailures;
++    return result;
+ }
+ 
+ u32 FATStorage::WriteSectors(u32 start, u32 num, const u8* data)
+ {
+-    if (ReadOnly) return 0;
+-    return WriteSectorsInternal(File, FileSize, start, num, data);
++    ++Status.DldiWriteCalls;
++    if (!IsReady())
++    {
++        ++Status.DldiWriteFailures;
++        return 0;
++    }
++    if (ReadOnly)
++    {
++        ++Status.DldiWriteFailures;
++        MarkError(FATStorageError::ReadOnlyWrite);
++        return 0;
++    }
++
++    // Host-only deterministic fault injection used by the E2 acceptance
++    // harness. This environment switch is not set by the Android frontend.
++    static bool failNextDldiWrite = [] {
++        const char* value = std::getenv("PLUMP_E2_FAIL_NEXT_DLDI_WRITE");
++        return value && value[0] == '1';
++    }();
++    if (failNextDldiWrite)
++    {
++        failNextDldiWrite = false;
++        ++Status.DldiWriteFailures;
++        ++Status.WriteFailures;
++        MarkError(FATStorageError::WriteFailed, FR_DISK_ERR);
++        return 0;
++    }
++
++    const u32 result = WriteSectorsInternal(File, FileSize, start, num, data);
++    if (result != num) ++Status.DldiWriteFailures;
++    return result;
+ }
+ 
+ u64 FATStorage::GetSectorCount() const
+@@ -189,14 +289,14 @@ u64 FATStorage::GetSectorCount() const
+     return FileSize / 0x200;
+ }
+ 
+-ff_disk_read_cb FATStorage::FF_ReadStorage() const noexcept
++ff_disk_read_cb FATStorage::FF_ReadStorage() noexcept
+ {
+     return [this](BYTE* buf, LBA_t sector, UINT num) {
+         return ReadSectorsInternal(File, FileSize, sector, num, buf);
+     };
+ }
+ 
+-ff_disk_write_cb FATStorage::FF_WriteStorage() const noexcept
++ff_disk_write_cb FATStorage::FF_WriteStorage() noexcept
+ {
+     return [this](const BYTE* buf, LBA_t sector, UINT num) {
+         return WriteSectorsInternal(File, FileSize, sector, num, buf);
+@@ -206,50 +306,83 @@ ff_disk_write_cb FATStorage::FF_WriteStorage() const noexcept
+ 
+ u32 FATStorage::ReadSectorsInternal(FileHandle* file, u64 filelen, u32 start, u32 num, u8* data)
+ {
+-    if (!file) return 0;
++    if (!file || !data || num == 0)
++    {
++        if (!file) { ++Status.ReadFailures; MarkError(FATStorageError::ReadFailed); }
++        return 0;
++    }
+ 
+     u64 addr = start * 0x200ULL;
+-    u32 len = num * 0x200;
++    const u64 len = static_cast<u64>(num) * 0x200ULL;
+ 
+-    if ((addr+len) > filelen)
++    if (addr > filelen || len > filelen - addr)
+     {
+-        if (addr >= filelen) return 0;
+-        len = filelen - addr;
+-        num = len >> 9;
++        ++Status.ReadFailures;
++        MarkError(FATStorageError::OutOfRange);
++        return 0;
+     }
+ 
+-    FileSeek(file, addr, FileSeekOrigin::Start);
++    if (!FileSeek(file, addr, FileSeekOrigin::Start))
++    {
++        ++Status.ReadFailures;
++        MarkError(FATStorageError::ReadSeekFailed);
++        return 0;
++    }
+ 
+     u32 res = FileRead(data, 0x200, num, file);
+     if (res < num)
+     {
+-        if (IsEndOfFile(file))
+-        {
+-            memset(&data[0x200*res], 0, 0x200*(num-res));
+-            return num;
+-        }
++        ++Status.ReadFailures;
++        MarkError(FATStorageError::ReadFailed);
++        return res;
+     }
+ 
++    Status.SectorsRead += res;
+     return res;
+ }
+ 
+ u32 FATStorage::WriteSectorsInternal(FileHandle* file, u64 filelen, u32 start, u32 num, const u8* data)
+ {
+-    if (!file) return 0;
++    if (!file || !data || num == 0)
++    {
++        if (!file) { ++Status.WriteFailures; MarkError(FATStorageError::WriteFailed); }
++        return 0;
++    }
++    if (ReadOnly)
++    {
++        ++Status.WriteFailures;
++        MarkError(FATStorageError::ReadOnlyWrite);
++        return 0;
++    }
+ 
+     u64 addr = start * 0x200ULL;
+-    u32 len = num * 0x200;
++    const u64 len = static_cast<u64>(num) * 0x200ULL;
+ 
+-    if ((addr+len) > filelen)
++    if (addr > filelen || len > filelen - addr)
+     {
+-        if (addr >= filelen) return 0;
+-        len = filelen - addr;
+-        num = len >> 9;
++        ++Status.WriteFailures;
++        MarkError(FATStorageError::OutOfRange);
++        return 0;
+     }
+ 
+-    FileSeek(file, addr, FileSeekOrigin::Start);
++    if (!FileSeek(file, addr, FileSeekOrigin::Start))
++    {
++        ++Status.WriteFailures;
++        MarkError(FATStorageError::WriteSeekFailed);
++        return 0;
++    }
+ 
+     u32 res = Platform::FileWrite(data, 0x200, num, file);
++    if (res > 0)
++    {
++        Status.SectorsWritten += res;
++        Status.Dirty = 1;
++    }
++    if (res < num)
++    {
++        ++Status.WriteFailures;
++        MarkError(FATStorageError::WriteFailed);
++    }
+     return res;
+ }
+ 
+@@ -389,26 +522,28 @@ void FATStorage::LoadIndex()
+     }
+ }
+ 
+-void FATStorage::SaveIndex()
++bool FATStorage::SaveIndex()
+ {
+     FileHandle* f = OpenLocalFile(IndexPath, FileMode::WriteText);
+-    if (!f) return;
++    if (!f) return false;
+ 
+-    FileWriteFormatted(f, "SIZE %" PRIu64 "\n", FileSize);
++    bool okay = FileWriteFormatted(f, "SIZE %" PRIu64 "\n", FileSize) > 0;
+ 
+     for (const auto& [key, val] : DirIndex)
+     {
+-        FileWriteFormatted(f, "DIR %u %s\n",
+-                val.IsReadOnly?1:0, val.Path.c_str());
++        if (FileWriteFormatted(f, "DIR %u %s\n",
++                val.IsReadOnly?1:0, val.Path.c_str()) == 0) okay = false;
+     }
+ 
+     for (const auto& [key, val] : FileIndex)
+     {
+-        FileWriteFormatted(f, "FILE %u %" PRIu64 " %" PRId64 " %u %s\n",
+-                val.IsReadOnly?1:0, val.Size, val.LastModified, val.LastModifiedInternal, val.Path.c_str());
++        if (FileWriteFormatted(f, "FILE %u %" PRIu64 " %" PRId64 " %u %s\n",
++                val.IsReadOnly?1:0, val.Size, val.LastModified, val.LastModifiedInternal, val.Path.c_str()) == 0)
++            okay = false;
+     }
+ 
+-    CloseFile(f);
++    if (!CloseFile(f)) okay = false;
++    return okay;
+ }
+ 
+ 
+@@ -975,7 +1110,7 @@ bool FATStorage::ImportDirectory(const std::string& sourcedir)
+         f_chmod(innerpath.c_str(), readonly?AM_RDO:0, AM_RDO);
+     }
+ 
+-    SaveIndex();
++    if (!SaveIndex()) return false;
+ 
+     return true;
+ }
+@@ -1005,7 +1140,10 @@ u64 FATStorage::GetDirectorySize(fs::path sourcedir) const
+ 
+ bool FATStorage::Load(const std::string& filename, u64 size, const std::optional<string>& sourcedir)
+ {
++    Status.State = static_cast<u32>(FATStorageState::Opening);
++    Status.ReadOnly = ReadOnly ? 1 : 0;
+     bool hasdir = sourcedir && !sourcedir->empty();
++    Status.FolderSync = hasdir ? 1 : 0;
+     if (sourcedir)
+     {
+         if (!fs::is_directory(fs::u8path(*sourcedir)))
+@@ -1014,6 +1152,7 @@ bool FATStorage::Load(const std::string& filename, u64 size, const std::optional
+             SourceDir = std::nullopt;
+         }
+     }
++    Status.FolderSync = hasdir ? 1 : 0;
+ 
+     // 'auto' size management: (size=0)
+     // * if an index exists: the size from the index is used
+@@ -1022,38 +1161,47 @@ bool FATStorage::Load(const std::string& filename, u64 size, const std::optional
+     //   with a minimum 128MB extra, otherwise size is defaulted to 512MB
+ 
+     bool isnew = !Platform::LocalFileExists(filename);
+-    File = Platform::OpenLocalFile(filename, static_cast<FileMode>(FileMode::ReadWrite | FileMode::Preserve));
++    const FileMode openMode = RequireExisting ? FileMode::ReadWriteExisting :
++        static_cast<FileMode>(FileMode::ReadWrite | FileMode::Preserve);
++    File = Platform::OpenLocalFile(filename, openMode);
+     if (!File)
++    {
++        MarkError(RequireExisting && isnew ? FATStorageError::MissingImage : FATStorageError::OpenFailed);
+         return false;
++    }
++    Status.ImageBytes = FileLength(File);
+ 
+     IndexPath = FilePath + ".idx";
+-    if (isnew)
++    if (hasdir && isnew)
+     {
+         DirIndex.clear();
+         FileIndex.clear();
+-        SaveIndex();
++        if (!SaveIndex())
++        {
++            MarkError(FATStorageError::IndexWriteFailed);
++            return false;
++        }
+     }
+-    else
++    else if (hasdir)
+     {
+         LoadIndex();
+-
+-        if (FileSize == 0)
+-        {
+-            FileSize = FileLength(File);
+-        }
+     }
++    else
++        FileSize = FileLength(File); // With folder sync disabled, the image is authoritative; ignore .idx.
+ 
+-    bool needformat = false;
++    if (FileSize == 0 && !isnew)
++        FileSize = FileLength(File);
++
++    bool needformat = isnew || FileSize == 0;
++    bool diskOpen = false;
+     FATFS fs;
+-    FRESULT res;
++    FRESULT res = FR_OK;
+ 
+-    if (FileSize == 0)
+-    {
+-        needformat = true;
+-    }
+-    else
++    bool sizeMismatch = false;
++    if (!needformat)
+     {
+         ff_disk_open(FF_ReadStorage(), FF_WriteStorage(), (LBA_t)(FileSize>>9));
++        diskOpen = true;
+ 
+         res = f_mount(&fs, "0:", 1);
+         if (res != FR_OK)
+@@ -1063,11 +1211,35 @@ bool FATStorage::Load(const std::string& filename, u64 size, const std::optional
+         else if (size > 0 && size != FileSize)
+         {
+             needformat = true;
++            sizeMismatch = true;
++            res = FR_INVALID_PARAMETER;
+         }
+     }
+ 
++    if ((FileSize % 0x200ULL) != 0)
++    {
++        MarkError(FATStorageError::InvalidImage, FR_INVALID_PARAMETER);
++        if (diskOpen) { f_unmount("0:"); ff_disk_close(); }
++        return false;
++    }
++
+     if (needformat)
+     {
++        // Existing images are player data. Plump's frontend opts out of
++        // automatic repair/formatting; only a new image may be initialized.
++        if (!isnew && !FormatIfInvalid)
++        {
++            MarkError(sizeMismatch ? FATStorageError::ImageSizeMismatch : FATStorageError::InvalidImage, res);
++            if (diskOpen) { f_unmount("0:"); ff_disk_close(); }
++            return false;
++        }
++        if (ReadOnly)
++        {
++            MarkError(FATStorageError::ReadOnlyWrite, FR_DENIED);
++            if (diskOpen) { f_unmount("0:"); ff_disk_close(); }
++            return false;
++        }
++
+         FileSize = size;
+         if (FileSize == 0)
+         {
+@@ -1089,12 +1261,29 @@ bool FATStorage::Load(const std::string& filename, u64 size, const std::optional
+                 FileSize = 0x20000000ULL; // 512MB
+         }
+ 
+-        ff_disk_close();
++        if ((FileSize % 0x200ULL) != 0)
++        {
++            MarkError(FATStorageError::ImageSizeMismatch, FR_INVALID_PARAMETER);
++            if (diskOpen) { f_unmount("0:"); ff_disk_close(); }
++            return false;
++        }
++
++        if (diskOpen) { f_unmount("0:"); ff_disk_close(); diskOpen = false; }
+         ff_disk_open(FF_ReadStorage(), FF_WriteStorage(), (LBA_t)(FileSize>>9));
++        diskOpen = true;
+ 
+-        DirIndex.clear();
+-        FileIndex.clear();
+-        SaveIndex();
++        if (hasdir)
++        {
++            DirIndex.clear();
++            FileIndex.clear();
++            if (!SaveIndex())
++            {
++                MarkError(FATStorageError::IndexWriteFailed);
++                f_unmount("0:");
++                ff_disk_close();
++                return false;
++            }
++        }
+ 
+         FF_MKFS_PARM fsopt;
+ 
+@@ -1113,21 +1302,45 @@ bool FATStorage::Load(const std::string& filename, u64 size, const std::optional
+ 
+         BYTE workbuf[FF_MAX_SS];
+         res = f_mkfs("0:", &fsopt, workbuf, sizeof(workbuf));
++        if (res != FR_OK)
++        {
++            MarkError(FATStorageError::FormatFailed, res);
++            f_unmount("0:");
++            ff_disk_close();
++            return false;
++        }
+ 
+-        if (res == FR_OK)
+-            res = f_mount(&fs, "0:", 1);
++        res = f_mount(&fs, "0:", 1);
++        if (res != FR_OK)
++        {
++            MarkError(FATStorageError::MountFailed, res);
++            f_unmount("0:");
++            ff_disk_close();
++            return false;
++        }
+     }
+ 
+     if (res == FR_OK)
+     {
+-        if (hasdir)
+-            ImportDirectory(*sourcedir);
++        if (hasdir && !ImportDirectory(*sourcedir))
++        {
++            MarkError(FATStorageError::ImportFailed);
++            f_unmount("0:");
++            ff_disk_close();
++            return false;
++        }
+     }
+ 
+     f_unmount("0:");
+-
+     ff_disk_close();
+-
++    diskOpen = false;
++    if (Status.FirstError != static_cast<u32>(FATStorageError::None))
++    {
++        Status.State = static_cast<u32>(FATStorageState::Failed);
++        return false;
++    }
++    Status.ImageBytes = FileSize;
++    Status.State = static_cast<u32>(FATStorageState::Ready);
+     return true;
+ }
+ 
+@@ -1146,6 +1359,7 @@ bool FATStorage::Save()
+     res = f_mount(&fs, "0:", 1);
+     if (res != FR_OK)
+     {
++        MarkError(FATStorageError::MountFailed, res);
+         f_unmount("0:");
+         ff_disk_close();
+         return false;
+@@ -1153,13 +1367,18 @@ bool FATStorage::Save()
+ 
+     ExportChanges(*SourceDir);
+ 
+-    SaveIndex();
++    const bool indexSaved = SaveIndex();
+ 
+     f_unmount("0:");
+ 
+     ff_disk_close();
+ 
++    if (!indexSaved)
++    {
++        MarkError(FATStorageError::IndexWriteFailed);
++        return false;
++    }
+     return true;
+ }
+ 
+-}
+\ No newline at end of file
++}
+diff --git a/src/FATStorage.h b/src/FATStorage.h
+index 4badb400..fbf8c362 100644
+--- a/src/FATStorage.h
++++ b/src/FATStorage.h
+@@ -45,12 +45,76 @@ struct FATStorageArgs
+     u64 Size;
+     bool ReadOnly;
+     std::optional<std::string> SourceDir;
++    // Frontends that own image creation can require a pre-provisioned image
++    // and refuse to format an existing image whose FAT cannot be mounted.
++    bool RequireExisting = false;
++    bool FormatIfInvalid = true;
++};
++
++enum class FATStorageState : u32
++{
++    Disabled = 0,
++    Opening = 1,
++    Ready = 2,
++    Failed = 3,
++    Closed = 4,
++};
++
++enum class FATStorageError : u32
++{
++    None = 0,
++    MissingImage = 1,
++    OpenFailed = 2,
++    InvalidImage = 3,
++    ImageSizeMismatch = 4,
++    FormatFailed = 5,
++    MountFailed = 6,
++    ReadSeekFailed = 7,
++    ReadFailed = 8,
++    WriteSeekFailed = 9,
++    WriteFailed = 10,
++    ReadOnlyWrite = 11,
++    StreamFlushFailed = 12,
++    CloseFailed = 13,
++    ImportFailed = 14,
++    IndexWriteFailed = 15,
++    InjectFailed = 16,
++    OutOfRange = 17,
++};
++
++// Fixed-width snapshot for frontends that need to distinguish a usable DLDI
++// image from a merely successful core/ROM load. Stream flush is not fsync.
++struct FATStorageStatus
++{
++    u32 Version = 1;
++    u32 State = static_cast<u32>(FATStorageState::Disabled);
++    u32 FirstError = static_cast<u32>(FATStorageError::None);
++    u32 LastError = static_cast<u32>(FATStorageError::None);
++    u32 LastFatResult = 0;
++    u64 ImageBytes = 0;
++    u64 SectorsRead = 0;
++    u64 SectorsWritten = 0;
++    u64 ReadFailures = 0;
++    u64 WriteFailures = 0;
++    u64 DldiReadCalls = 0;
++    u64 DldiWriteCalls = 0;
++    u64 DldiReadFailures = 0;
++    u64 DldiWriteFailures = 0;
++    u32 ReadOnly = 0;
++    u32 FolderSync = 0;
++    u32 Dirty = 0;
++    u32 FlushAttempted = 0;
++    u32 FlushSucceeded = 0;
++    u32 CloseAttempted = 0;
++    u32 CloseSucceeded = 0;
+ };
+ 
+ class FATStorage
+ {
+ public:
+-    FATStorage(const std::string& filename, u64 size, bool readonly, const std::optional<std::string>& sourcedir = std::nullopt);
++    FATStorage(const std::string& filename, u64 size, bool readonly,
++               const std::optional<std::string>& sourcedir = std::nullopt,
++               bool requireExisting = false, bool formatIfInvalid = true);
+     explicit FATStorage(const FATStorageArgs& args) noexcept;
+     explicit FATStorage(FATStorageArgs&& args) noexcept;
+     FATStorage(FATStorage&& other) noexcept;
+@@ -59,13 +123,19 @@ public:
+     FATStorage& operator=(FATStorage&& other) noexcept;
+     ~FATStorage();
+ 
++    bool Close() noexcept;
++
+     bool InjectFile(const std::string& path, u8* data, u32 len);
+     u32 ReadFile(const std::string& path, u32 start, u32 len, u8* data);
+ 
+-    u32 ReadSectors(u32 start, u32 num, u8* data) const;
++    u32 ReadSectors(u32 start, u32 num, u8* data);
+     u32 WriteSectors(u32 start, u32 num, const u8* data);
+ 
+     [[nodiscard]] bool IsReadOnly() const noexcept { return ReadOnly; }
++    [[nodiscard]] bool IsReady() const noexcept {
++        return File && Status.State == static_cast<u32>(FATStorageState::Ready);
++    }
++    [[nodiscard]] FATStorageStatus GetStatus() const noexcept { return Status; }
+     u64 GetSectorCount() const;
+ 
+ private:
+@@ -73,18 +143,23 @@ private:
+     std::string IndexPath;
+     std::optional<std::string> SourceDir;
+     bool ReadOnly;
++    bool RequireExisting = false;
++    bool FormatIfInvalid = true;
++
++    Platform::FileHandle* File = nullptr;
++    u64 FileSize = 0;
++    FATStorageStatus Status {};
+ 
+-    Platform::FileHandle* File;
+-    u64 FileSize;
++    void MarkError(FATStorageError error, FRESULT fatResult = FR_OK) noexcept;
+ 
+-    [[nodiscard]] ff_disk_read_cb FF_ReadStorage() const noexcept;
+-    [[nodiscard]] ff_disk_write_cb FF_WriteStorage() const noexcept;
++    [[nodiscard]] ff_disk_read_cb FF_ReadStorage() noexcept;
++    [[nodiscard]] ff_disk_write_cb FF_WriteStorage() noexcept;
+ 
+-    static u32 ReadSectorsInternal(Platform::FileHandle* file, u64 filelen, u32 start, u32 num, u8* data);
+-    static u32 WriteSectorsInternal(Platform::FileHandle* file, u64 filelen, u32 start, u32 num, const u8* data);
++    u32 ReadSectorsInternal(Platform::FileHandle* file, u64 filelen, u32 start, u32 num, u8* data);
++    u32 WriteSectorsInternal(Platform::FileHandle* file, u64 filelen, u32 start, u32 num, const u8* data);
+ 
+     void LoadIndex();
+-    void SaveIndex();
++    bool SaveIndex();
+ 
+     bool ExportFile(const std::string& path, std::filesystem::path out);
+     void ExportDirectory(const std::string& path, const std::string& outbase, int level);
+diff --git a/src/NDSCart/CartHomebrew.cpp b/src/NDSCart/CartHomebrew.cpp
+index ab531260..1b0baf97 100644
+--- a/src/NDSCart/CartHomebrew.cpp
++++ b/src/NDSCart/CartHomebrew.cpp
+@@ -46,7 +46,7 @@ void CartHomebrew::Reset()
+ {
+     CartSD::Reset();
+ 
+-    if (SD)
++    if (SD && SD->IsReady())
+         ApplyDLDIPatch(melonDLDI, sizeof(melonDLDI), SD->IsReadOnly());
+ }
+ 
+diff --git a/src/NDSCart/CartSD.h b/src/NDSCart/CartSD.h
+index 9e2723bf..958a2195 100644
+--- a/src/NDSCart/CartSD.h
++++ b/src/NDSCart/CartSD.h
+@@ -34,6 +34,7 @@ public:
+     ~CartSD() override;
+ 
+     [[nodiscard]] const std::optional<FATStorage>& GetSDCard() const noexcept { return SD; }
++    bool CloseSDCard() noexcept { return !SD || SD->Close(); }
+     void SetSDCard(FATStorage&& sdcard) noexcept { SD = std::move(sdcard); }
+     void SetSDCard(std::optional<FATStorage>&& sdcard) noexcept
+     {

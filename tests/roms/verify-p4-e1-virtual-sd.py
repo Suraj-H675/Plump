@@ -15,8 +15,10 @@ import resource
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
-HOST_CORE = ROOT / "app/build/p3-melonds-host/src/libretro/melondsds_libretro.so"
-CORE_SHA = "e8c5fd156e9d1fe9fa861cd93cc0ef25ddc7eecb0ccf65a6a6a8c4695e577616"
+HOST_CORE = Path(os.environ.get(
+    "PLUMP_HOST_CORE", str(ROOT / "app/build/p3-melonds-host/src/libretro/melondsds_libretro.so")))
+CORE_SHA = os.environ.get(
+    "PLUMP_HOST_CORE_SHA256", "e8c5fd156e9d1fe9fa861cd93cc0ef25ddc7eecb0ccf65a6a6a8c4695e577616")
 E1B_ROM_ROOT = Path(os.environ.get(
     "PLUMP_E1B_ROM_ROOT", str(ROOT / "app/build/p4-e1-b")))
 GAMES = {
@@ -55,6 +57,35 @@ class Variable(ct.Structure):
     _fields_ = [("key", ct.c_char_p), ("value", ct.c_char_p)]
 
 
+class DldiStatusV1(ct.Structure):
+    _fields_ = [
+        ("version", ct.c_uint32), ("state", ct.c_uint32),
+        ("first_error", ct.c_uint32), ("last_error", ct.c_uint32),
+        ("last_fat_result", ct.c_uint32),
+        ("image_bytes", ct.c_uint64), ("sectors_read", ct.c_uint64),
+        ("sectors_written", ct.c_uint64), ("read_failures", ct.c_uint64),
+        ("write_failures", ct.c_uint64), ("dldi_read_calls", ct.c_uint64),
+        ("dldi_write_calls", ct.c_uint64), ("dldi_read_failures", ct.c_uint64),
+        ("dldi_write_failures", ct.c_uint64),
+        ("read_only", ct.c_uint32), ("folder_sync", ct.c_uint32),
+        ("dirty", ct.c_uint32), ("flush_attempted", ct.c_uint32),
+        ("flush_succeeded", ct.c_uint32), ("close_attempted", ct.c_uint32),
+        ("close_succeeded", ct.c_uint32),
+    ]
+
+
+def read_dldi_status(core):
+    function = getattr(core, "melondsds_dldi_status_v1", None)
+    if function is None:
+        return None
+    function.argtypes = [ct.POINTER(DldiStatusV1)]
+    function.restype = ct.c_bool
+    status = DldiStatusV1()
+    if not function(ct.byref(status)):
+        raise AssertionError("Pinned core's DLDI status API rejected the snapshot")
+    return {name: getattr(status, name) for name, _ in status._fields_}
+
+
 Environment = ct.CFUNCTYPE(ct.c_bool, ct.c_uint, ct.c_void_p)
 Video = ct.CFUNCTYPE(None, ct.c_void_p, ct.c_uint, ct.c_uint, ct.c_size_t)
 Audio = ct.CFUNCTYPE(None, ct.c_int16, ct.c_int16)
@@ -89,11 +120,17 @@ def run_once(run_root, game_key, frames, readonly=False, hard_stop=False):
     system = root / "system"
     target = save / "melonDS DS" / "dldi_sd_card.bin"
     index = target.with_suffix(target.suffix + ".idx")
-    if not save.is_dir() or not system.is_dir() or not target.is_file() or target.is_symlink():
-        raise ValueError("Missing preformatted test image or paths")
-    if target.stat().st_size != IMAGE_LEN or index.is_symlink():
-        raise ValueError("DLDI volume must be exactly 128 MiB and sidecars nonsymlink")
-    saved_image_digest = digest(target)
+    allow_missing_image = os.environ.get("PLUMP_E2_ALLOW_MISSING_IMAGE") == "1"
+    if not save.is_dir() or not system.is_dir() or target.is_symlink() or index.is_symlink():
+        raise ValueError("Missing disposable test directories or a symlinked image/sidecar")
+    if target.is_file():
+        if target.stat().st_size != IMAGE_LEN:
+            raise ValueError("DLDI volume must be exactly 128 MiB")
+        saved_image_digest = digest(target)
+    elif allow_missing_image:
+        saved_image_digest = None
+    else:
+        raise ValueError("Missing preformatted test image")
 
     # Keep each core-generated file bounded even if its fallback formatting path
     # unexpectedly expands a corrupted image. Never allocate default 4 GiB.
@@ -188,6 +225,9 @@ def run_once(run_root, game_key, frames, readonly=False, hard_stop=False):
                     len(rom_data) - 1, None)
     core.retro_init()
     loaded = False
+    dldi_status_before_close = None
+    dldi_close_returned = None
+    dldi_status_after_close = None
     try:
         loaded = bool(core.retro_load_game(ct.byref(game)))
         if not loaded:
@@ -199,12 +239,29 @@ def run_once(run_root, game_key, frames, readonly=False, hard_stop=False):
             os._exit(87)  # Deliberate host-only process cut, not an in-sector interruption.
     finally:
         if loaded:
+            dldi_status_before_close = read_dldi_status(core)
+            close_function = getattr(core, "melondsds_dldi_close_v1", None)
+            if close_function is not None:
+                close_function.argtypes = []
+                close_function.restype = ct.c_bool
+                dldi_close_returned = bool(close_function())
+                dldi_status_after_close = read_dldi_status(core)
+            elif os.environ.get("PLUMP_E2_REQUIRE_STATUS") == "1":
+                raise AssertionError("E2 core status/close API is missing")
             core.retro_unload_game()
         core.retro_deinit()
 
-    after_size = target.stat().st_size
-    if after_size != IMAGE_LEN:
-        raise AssertionError("Image size grew or shrank unexpectedly: " + str(after_size))
+    image_exists_after = target.is_file() and not target.is_symlink()
+    if saved_image_digest is None:
+        if image_exists_after:
+            raise AssertionError("Core unexpectedly created a missing production-owned image")
+        after_size = 0
+    else:
+        if not image_exists_after:
+            raise AssertionError("Core removed the pre-existing image")
+        after_size = target.stat().st_size
+        if after_size != IMAGE_LEN:
+            raise AssertionError("Image size grew or shrank unexpectedly: " + str(after_size))
     if not {"melonds_homebrew_sdcard", "melonds_homebrew_sync_sdcard_to_host",
             "melonds_homebrew_readonly"}.issubset(seen):
         raise AssertionError("Pinned core never requested E1 experimental DLDI options")
@@ -229,9 +286,9 @@ def run_once(run_root, game_key, frames, readonly=False, hard_stop=False):
         "host_folder_sync_disabled_requested": True,
         "experiment_readonly_requested": readonly,
         "image_logical_bytes": after_size,
-        "image_allocated_bytes": target.stat().st_blocks * 512,
+        "image_allocated_bytes": target.stat().st_blocks * 512 if image_exists_after else 0,
         "image_sha256_before": saved_image_digest,
-        "image_sha256_after": digest(target),
+        "image_sha256_after": digest(target) if image_exists_after else None,
         "index_present": index.is_file(),
         "index_bytes": index.stat().st_size if index.is_file() else None,
         "folder_sync_directory_present": (target.parent / "dldi_sd_card").exists(),
@@ -239,6 +296,9 @@ def run_once(run_root, game_key, frames, readonly=False, hard_stop=False):
         "proof_type": ("pinned-core-homebrew-execution-only; independently inspect "
                        "PLUMP record/report files for genuine writer proof"),
         "diagnostic_frame_captured": last_frame[0] is not None,
+        "dldi_status_before_close": dldi_status_before_close,
+        "dldi_close_returned": dldi_close_returned,
+        "dldi_status_after_close": dldi_status_after_close,
     }
     (root / "result.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
     print("P4_E1_HOST_BOOT", json.dumps(result, sort_keys=True), flush=True)

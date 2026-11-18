@@ -1,0 +1,87 @@
+diff --git a/streams/file_stream.c b/streams/file_stream.c
+index f680d68c..7b2d1d68 100644
+--- a/streams/file_stream.c
++++ b/streams/file_stream.c
+@@ -1857,13 +1857,18 @@ int filestream_close(RFILE *stream)
+    struct retro_vfs_file_handle* fp = stream->hfile;
+ 
+    if (filestream_close_cb)
++   {
+       output = filestream_close_cb(fp);
++      if (output == 0)
++      {
++         free(stream->rbuf);
++         free(stream);
++      }
++   }
+    else
++   {
+       output = retro_vfs_file_close_impl(
+             (libretro_vfs_implementation_file*)fp);
+-
+-   if (output == 0)
+-   {
+       free(stream->rbuf);
+       free(stream);
+    }
+diff --git a/vfs/vfs_implementation.c b/vfs/vfs_implementation.c
+index 917141f7..ae4a40d5 100644
+--- a/vfs/vfs_implementation.c
++++ b/vfs/vfs_implementation.c
+@@ -1018,6 +1018,7 @@ error:
+ 
+ int retro_vfs_file_close_impl(libretro_vfs_implementation_file *stream)
+ {
++   int close_result = 0;
+    if (!stream)
+       return -1;
+ 
+@@ -1040,7 +1041,11 @@ int retro_vfs_file_close_impl(libretro_vfs_implementation_file *stream)
+    if ((stream->hints & RFILE_HINT_UNBUFFERED) == 0)
+    {
+       if (stream->fp)
+-         fclose(stream->fp);
++      {
++         if (fclose(stream->fp) != 0)
++            close_result = -1;
++         stream->fp = NULL;
++      }
+    }
+    else
+    {
+@@ -1062,7 +1067,11 @@ int retro_vfs_file_close_impl(libretro_vfs_implementation_file *stream)
+    }
+ 
+    if (stream->fd >= 0)
+-      close(stream->fd);
++   {
++      if (close(stream->fd) != 0)
++         close_result = -1;
++      stream->fd = -1;
++   }
+ #ifdef HAVE_CDROM
+ end:
+    /* Reached both by the goto above and by fall-through from the
+@@ -1082,12 +1091,21 @@ smbend:
+    if (stream->buf)
+       free(stream->buf);
+ 
++   /* E2 host-only fault injection: exercise the core's close-error path after
++    * the real descriptor has been closed. Never enabled by Plump Android. */
++   if (stream->orig_path && strstr(stream->orig_path, "dldi_sd_card.bin"))
++   {
++      const char *fail_close = getenv("PLUMP_E2_FAIL_FILE_CLOSE");
++      if (fail_close && fail_close[0] == '1' && fail_close[1] == '\0')
++         close_result = -1;
++   }
++
+    if (stream->orig_path)
+       free(stream->orig_path);
+ 
+    free(stream);
+ 
+-   return 0;
++   return close_result;
+ }
+ 
+ int retro_vfs_file_error_impl(libretro_vfs_implementation_file *stream)

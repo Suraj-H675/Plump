@@ -1,0 +1,87 @@
+--- app/build/p4-e2-work/baseline/test.cpp	2026-11-18 09:38:38.373015776 +0530
++++ app/build/p3-melonds-source/src/libretro/core/test.cpp	2026-11-18 09:41:20.932030957 +0530
+@@ -25,6 +25,7 @@
+ #include "core.hpp"
+ #include "environment.hpp"
+ #include "input/rumble.hpp"
++#include <NDSCart/CartSD.h>
+ 
+ namespace MelonDsDs
+ {
+@@ -97,6 +98,76 @@
+     return console != nullptr;
+ }
+ 
++// Plump host-only prototype API. Versioned fixed-width fields are mirrored by
++// the host acceptance harness; this is not a stable upstream Libretro API.
++struct PlumpDldiStatusV1 {
++    uint32_t version;
++    uint32_t state;
++    uint32_t first_error;
++    uint32_t last_error;
++    uint32_t last_fat_result;
++    uint64_t image_bytes;
++    uint64_t sectors_read;
++    uint64_t sectors_written;
++    uint64_t read_failures;
++    uint64_t write_failures;
++    uint64_t dldi_read_calls;
++    uint64_t dldi_write_calls;
++    uint64_t dldi_read_failures;
++    uint64_t dldi_write_failures;
++    uint32_t read_only;
++    uint32_t folder_sync;
++    uint32_t dirty;
++    uint32_t flush_attempted;
++    uint32_t flush_succeeded;
++    uint32_t close_attempted;
++    uint32_t close_succeeded;
++};
++
++extern "C" bool melondsds_dldi_status_v1(PlumpDldiStatusV1* output) {
++    if (!output) return false;
++    *output = {};
++    output->version = 1;
++    using namespace MelonDsDs;
++    const melonDS::NDS* console = Core.GetConsole();
++    if (!console) return true;
++    const auto* cart = dynamic_cast<const melonDS::NDSCart::CartSD*>(console->GetNDSCart());
++    if (!cart) return true;
++    const auto& storage = cart->GetSDCard();
++    if (!storage) return true;
++    const auto status = storage->GetStatus();
++    output->version = status.Version;
++    output->state = status.State;
++    output->first_error = status.FirstError;
++    output->last_error = status.LastError;
++    output->last_fat_result = status.LastFatResult;
++    output->image_bytes = status.ImageBytes;
++    output->sectors_read = status.SectorsRead;
++    output->sectors_written = status.SectorsWritten;
++    output->read_failures = status.ReadFailures;
++    output->write_failures = status.WriteFailures;
++    output->dldi_read_calls = status.DldiReadCalls;
++    output->dldi_write_calls = status.DldiWriteCalls;
++    output->dldi_read_failures = status.DldiReadFailures;
++    output->dldi_write_failures = status.DldiWriteFailures;
++    output->read_only = status.ReadOnly;
++    output->folder_sync = status.FolderSync;
++    output->dirty = status.Dirty;
++    output->flush_attempted = status.FlushAttempted;
++    output->flush_succeeded = status.FlushSucceeded;
++    output->close_attempted = status.CloseAttempted;
++    output->close_succeeded = status.CloseSucceeded;
++    return true;
++}
++
++extern "C" bool melondsds_dldi_close_v1() {
++    using namespace MelonDsDs;
++    melonDS::NDS* console = Core.GetConsole();
++    if (!console) return false;
++    auto* cart = dynamic_cast<melonDS::NDSCart::CartSD*>(console->GetNDSCart());
++    return cart && cart->CloseSDCard();
++}
++
+ extern "C" bool melondsds_arm7_bios_native() {
+     using namespace MelonDsDs;
+     const melonDS::NDS* console = Core.GetConsole();

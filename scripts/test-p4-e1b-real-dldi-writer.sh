@@ -7,8 +7,8 @@ set -euo pipefail
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo"
 
-core=app/build/p3-melonds-host/src/libretro/melondsds_libretro.so
-core_sha=e8c5fd156e9d1fe9fa861cd93cc0ef25ddc7eecb0ccf65a6a6a8c4695e577616
+core="${PLUMP_E1B_HOST_CORE:-app/build/p3-melonds-host/src/libretro/melondsds_libretro.so}"
+core_sha="${PLUMP_E1B_HOST_CORE_SHA256:-e8c5fd156e9d1fe9fa861cd93cc0ef25ddc7eecb0ccf65a6a6a8c4695e577616}"
 alpha_rom_sha=1dbbf7e6dea0068a4495b5d3fff5d20f61b099ba48bf9fc0dc0512b136c40588
 beta_rom_sha=e01a1934e49732c6266bef6b51e64ae74ae5d0d5a426d802cf311f29854823e5
 expected_blocksds='blocksds-toolchain 1.25.0-1'
@@ -144,7 +144,8 @@ boot() {
     local dest="$work/$stage"
     local img="$dest/$image_name"
     require_image_bounded "$img"
-    timeout 75 python3 -u tests/roms/verify-p4-e1-virtual-sd.py \
+    PLUMP_HOST_CORE="$core" PLUMP_HOST_CORE_SHA256="$core_sha" \
+        timeout 75 python3 -u tests/roms/verify-p4-e1-virtual-sd.py \
         "$dest" "$game" 180 > "$dest/boot-$generation.log" 2>&1 || {
             echo "FAILED pinned-core boot stage=$stage generation=$generation" >&2
             tail -n 90 "$dest/boot-$generation.log" >&2
