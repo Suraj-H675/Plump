@@ -9,6 +9,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -343,6 +344,67 @@ Java_dev_plump_emulator_NativeDs_initialize(JNIEnv* env, jclass, jstring system,
 }
 
 #ifdef PLUMP_E3_DLDI_TEST
+namespace {
+jlongArray encodeE3DldiStatus(JNIEnv* env, const DldiStatusV1& after, bool closeReturned) {
+    const jlong result[] = {
+        after.version, after.state, after.firstError, after.lastError,
+        after.lastFatResult, static_cast<jlong>(after.imageBytes),
+        static_cast<jlong>(after.sectorsRead), static_cast<jlong>(after.sectorsWritten),
+        static_cast<jlong>(after.readFailures), static_cast<jlong>(after.writeFailures),
+        static_cast<jlong>(after.dldiReadCalls), static_cast<jlong>(after.dldiWriteCalls),
+        static_cast<jlong>(after.dldiReadFailures), static_cast<jlong>(after.dldiWriteFailures),
+        after.readOnly, after.folderSync, after.dirty, after.flushAttempted,
+        after.flushSucceeded, after.closeAttempted, after.closeSucceeded,
+        closeReturned ? 1LL : 0LL
+    };
+    jlongArray array = env->NewLongArray(static_cast<jsize>(sizeof(result) / sizeof(result[0])));
+    if (array) env->SetLongArrayRegion(array, 0,
+            static_cast<jsize>(sizeof(result) / sizeof(result[0])), result);
+    return array;
+}
+} // namespace
+
+// Never exported from the production host. The literal package guard is a
+// second layer beyond the Java BuildConfig and Android app sandbox.
+extern "C" JNIEXPORT jboolean JNICALL
+Java_dev_plump_emulator_NativeDs_configureE3NativeFault(
+        JNIEnv* env, jclass, jstring packageName, jstring modeName) {
+    std::lock_guard<std::mutex> lock(coreMutex);
+    if (!packageName || !modeName || loaded || api.handle) return JNI_FALSE;
+    const char* package = env->GetStringUTFChars(packageName, nullptr);
+    if (!package) return JNI_FALSE;
+    const bool isTestPackage = std::strcmp(package, "dev.plump.emulator.e3native") == 0 ||
+            std::strcmp(package, "dev.plump.emulator.e3close") == 0;
+    env->ReleaseStringUTFChars(packageName, package);
+    if (!isTestPackage) return JNI_FALSE;
+    const char* rawMode = env->GetStringUTFChars(modeName, nullptr);
+    if (!rawMode) return JNI_FALSE;
+    const std::string mode(rawMode);
+    env->ReleaseStringUTFChars(modeName, rawMode);
+    if (mode != "NONE" && mode != "DLDI_WRITE" &&
+            mode != "STREAM_FLUSH" && mode != "FILE_CLOSE") return JNI_FALSE;
+    const char* const names[] = {
+        "PLUMP_E2_FAIL_NEXT_DLDI_WRITE", "PLUMP_E2_FAIL_STREAM_FLUSH",
+        "PLUMP_E2_FAIL_FILE_CLOSE"
+    };
+    const bool select[] = {mode == "DLDI_WRITE", mode == "STREAM_FLUSH", mode == "FILE_CLOSE"};
+    for (size_t index = 0; index < 3; ++index) {
+        if ((select[index] ? setenv(names[index], "1", 1) : unsetenv(names[index])) != 0)
+            return JNI_FALSE;
+    }
+    return JNI_TRUE;
+}
+
+extern "C" JNIEXPORT jlongArray JNICALL
+Java_dev_plump_emulator_NativeDs_snapshotE3DldiStatus(JNIEnv* env, jclass) {
+    std::lock_guard<std::mutex> lock(coreMutex);
+    if (!experimentalDldi || !loaded || !api.dldiStatus) return nullptr;
+    DldiStatusV1 status{};
+    if (!api.dldiStatus(&status) || status.version != 1 ||
+            status.imageBytes != 128ULL * 1024 * 1024) return nullptr;
+    return encodeE3DldiStatus(env, status, false);
+}
+
 extern "C" JNIEXPORT jstring JNICALL
 Java_dev_plump_emulator_NativeDs_initializeE3(JNIEnv* env, jclass, jstring system, jstring save) {
     return initializeCore(env, system, save, true);
@@ -363,21 +425,7 @@ Java_dev_plump_emulator_NativeDs_closeE3Dldi(JNIEnv* env, jclass) {
     const bool closeReturned = api.dldiClose();
     DldiStatusV1 after{};
     if (!api.dldiStatus(&after)) return nullptr;
-    const jlong result[] = {
-        after.version, after.state, after.firstError, after.lastError,
-        after.lastFatResult, static_cast<jlong>(after.imageBytes),
-        static_cast<jlong>(after.sectorsRead), static_cast<jlong>(after.sectorsWritten),
-        static_cast<jlong>(after.readFailures), static_cast<jlong>(after.writeFailures),
-        static_cast<jlong>(after.dldiReadCalls), static_cast<jlong>(after.dldiWriteCalls),
-        static_cast<jlong>(after.dldiReadFailures), static_cast<jlong>(after.dldiWriteFailures),
-        after.readOnly, after.folderSync, after.dirty, after.flushAttempted,
-        after.flushSucceeded, after.closeAttempted, after.closeSucceeded,
-        closeReturned ? 1LL : 0LL
-    };
-    jlongArray array = env->NewLongArray(static_cast<jsize>(sizeof(result) / sizeof(result[0])));
-    if (array) env->SetLongArrayRegion(array, 0,
-            static_cast<jsize>(sizeof(result) / sizeof(result[0])), result);
-    return array;
+    return encodeE3DldiStatus(env, after, closeReturned);
 }
 #endif
 

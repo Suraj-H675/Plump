@@ -87,8 +87,13 @@ cmake -S "$source_dir" -B "$out/android-build" -G Ninja \
 if ! grep -q 'GetStatus() const' "$deps/melonds-src/src/FATStorage.h"; then
   patch --batch --forward -d "$deps/melonds-src" -p1 < "$repo/patches/p4-e2/melonds-dldi-health.patch"
 fi
-if ! grep -q 'if (output == 0)' "$deps/libretro-common-src/streams/file_stream.c"; then
-  patch --batch --forward -d "$deps/libretro-common-src" -p1 < "$repo/patches/p4-e2/libretro-vfs-close-error.patch"
+# The old generic 'if (output == 0)' probe also matches the UNPATCHED file.
+# The originally frozen E3A ELF consequently lacks VFS close-error propagation.
+# Never silently rebuild/replace that accepted core with different bytes.
+# E3F uses a completely separate source, build directory and package identity.
+if ! grep -q 'PLUMP_E2_FAIL_FILE_CLOSE' "$deps/libretro-common-src/vfs/vfs_implementation.c"; then
+  echo 'E3A source lacks the VFS close-error patch; keep its frozen binary unchanged and use scripts/build-p4-e3f-native-close-arm64.sh for corrected test builds.' >&2
+  exit 1
 fi
 grep -q 'GetStatus() const' "$deps/melonds-src/src/FATStorage.h"
 grep -q 'if (output == 0)' "$deps/libretro-common-src/streams/file_stream.c"

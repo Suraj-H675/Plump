@@ -5,6 +5,9 @@ plugins {
 // Immutable, independently verified E3A candidate identities. A modified
 // native core cannot become authorized merely by updating its SHA receipt.
 def verifiedE3CoreSha = '9e7a84190385b8aa526f17ffcbbbd2f709d8b1ec3dfc608aa34cb8d6bbeba5f9'
+// Distinct E3F core: same pinned emulator revisions with the previously missed
+// VFS close-error propagation patch. Only the disposable e3close flavor uses it.
+def verifiedE3CloseCoreSha = 'abedb9ee7c1fcdc91a6b4451d3fba7fc9679f922e8b665c745e07a589eab27ad'
 def verifiedE3BaselineSha = '14788027f3601eafd227b15fd1ce50563f134d82ba47d3746b5f72d84539bd8e'
 // The old disposable installation has already completed its three-write limit.
 // Permit only named throwaway test identities; never alias production or E3B.
@@ -12,7 +15,8 @@ def e3DisposablePackage = providers.gradleProperty('plumpE3DisposablePackage')
         .orElse('dev.plump.emulator.e3interrupt').get()
 if (!(e3DisposablePackage in ['dev.plump.emulator.e3interrupt',
                              'dev.plump.emulator.e3rotate',
-                             'dev.plump.emulator.e3fault'])) {
+                             'dev.plump.emulator.e3fault',
+                             'dev.plump.emulator.e3native'])) {
     throw new GradleException('Unapproved E3 disposable package identity')
 }
 
@@ -36,6 +40,7 @@ android {
         }
         buildConfigField 'boolean', 'E3_TEST', 'false'
         buildConfigField 'boolean', 'E3_DEVICE_FAULT_TEST', 'false'
+        buildConfigField 'boolean', 'E3_DEVICE_NATIVE_FAULT_TEST', 'false'
         buildConfigField 'String', 'E3_EXPECTED_PACKAGE', '""'
         buildConfigField 'String', 'E3_CORE_SHA256', '""'
         buildConfigField 'String', 'E3_BASELINE_SHA256', '""'
@@ -67,8 +72,22 @@ android {
             versionNameSuffix '-e3c-disposable'
             buildConfigField 'boolean', 'E3_TEST', 'true'
             buildConfigField 'boolean', 'E3_DEVICE_FAULT_TEST', (e3DisposablePackage == 'dev.plump.emulator.e3fault').toString()
+            buildConfigField 'boolean', 'E3_DEVICE_NATIVE_FAULT_TEST', (e3DisposablePackage == 'dev.plump.emulator.e3native').toString()
             buildConfigField 'String', 'E3_EXPECTED_PACKAGE', '"' + e3DisposablePackage + '"'
             buildConfigField 'String', 'E3_CORE_SHA256', '"' + verifiedE3CoreSha + '"'
+            buildConfigField 'String', 'E3_BASELINE_SHA256', '"' + verifiedE3BaselineSha + '"'
+            externalNativeBuild {
+                cmake { cppFlags '-DPLUMP_E3_DLDI_TEST=1' }
+            }
+        }
+        e3close {
+            dimension 'mode'
+            applicationId 'dev.plump.emulator.e3close'
+            versionNameSuffix '-e3f-isolated-native-close'
+            buildConfigField 'boolean', 'E3_TEST', 'true'
+            buildConfigField 'boolean', 'E3_DEVICE_NATIVE_FAULT_TEST', 'true'
+            buildConfigField 'String', 'E3_EXPECTED_PACKAGE', '"dev.plump.emulator.e3close"'
+            buildConfigField 'String', 'E3_CORE_SHA256', '"' + verifiedE3CloseCoreSha + '"'
             buildConfigField 'String', 'E3_BASELINE_SHA256', '"' + verifiedE3BaselineSha + '"'
             externalNativeBuild {
                 cmake { cppFlags '-DPLUMP_E3_DLDI_TEST=1' }
@@ -89,6 +108,11 @@ android {
             java.srcDirs = ['src/e3test/java']
             jniLibs.srcDirs = ['build/e3test-core/jniLibs']
             assets.srcDirs = ['build/e3test-core/assets']
+        }
+        e3close {
+            java.srcDirs = ['src/e3test/java']
+            jniLibs.srcDirs = ['build/e3close-core/jniLibs']
+            assets.srcDirs = ['build/e3close-core/assets']
         }
     }
 
@@ -182,6 +206,34 @@ tasks.register('verifyAndStageE3TestInputs') {
         file('build/e3test-core/baseline.sha256').text = digest(experimentalBaseline) + '\n'
     }
 }
+// The corrected test core is never staged into E3B/E3C/production. Reuse only
+// previously verified CC0 assets and mGBA libraries in a separate build tree.
+tasks.register('verifyAndStageE3CloseInputs') {
+    dependsOn tasks.named('verifyAndStageE3TestInputs')
+    doLast {
+        def core = file('build/p4-e3f-close-core/libmelondsds_libretro.so')
+        def receipt = file('build/p4-e3f-close-core/core.sha256')
+        if (!core.isFile() || !receipt.isFile() ||
+                !receipt.text.trim().startsWith(verifiedE3CloseCoreSha))
+            throw new GradleException('E3F corrected native core or receipt missing')
+        def sha = java.security.MessageDigest.getInstance('SHA-256')
+        core.withInputStream { stream ->
+            byte[] bytes = new byte[65536]
+            int n
+            while ((n = stream.read(bytes)) != -1) sha.update(bytes, 0, n)
+        }
+        if (sha.digest().encodeHex().toString() != verifiedE3CloseCoreSha)
+            throw new GradleException('E3F native core failed frozen SHA-256 pin')
+        def staged = file('build/e3close-core')
+        def nativeDir = file('build/e3close-core/jniLibs/arm64-v8a')
+        nativeDir.mkdirs()
+        copy { from core; into nativeDir }
+        copy { from file('src/main/jniLibs/arm64-v8a/libmgba_libretro.so'); into nativeDir }
+        copy { from file('build/e3test-core/assets'); into file('build/e3close-core/assets') }
+        staged.mkdirs()
+        file('build/e3close-core/core.sha256').text = verifiedE3CloseCoreSha + '\n'
+    }
+}
 tasks.configureEach {
     if (name == 'mergeE3testDebugJniLibFolders' ||
             name == 'mergeE3testReleaseJniLibFolders' ||
@@ -192,6 +244,12 @@ tasks.configureEach {
             name == 'mergeE3interruptDebugAssets' ||
             name == 'mergeE3interruptReleaseAssets') {
         dependsOn tasks.named('verifyAndStageE3TestInputs')
+    }
+    if (name == 'mergeE3closeDebugJniLibFolders' ||
+            name == 'mergeE3closeReleaseJniLibFolders' ||
+            name == 'mergeE3closeDebugAssets' ||
+            name == 'mergeE3closeReleaseAssets') {
+        dependsOn tasks.named('verifyAndStageE3CloseInputs')
     }
 }
 

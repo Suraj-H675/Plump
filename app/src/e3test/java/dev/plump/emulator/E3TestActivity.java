@@ -348,6 +348,20 @@ public final class E3TestActivity extends Activity {
         VirtualSdGenerationStore.Outcome outcome = authorityUncertain
                 ? VirtualSdGenerationStore.Outcome.RECOVERY_REQUIRED : reported == null
                 ? VirtualSdGenerationStore.Outcome.NO_PENDING : reported.outcome;
+        if (BuildConfig.E3_DEVICE_NATIVE_FAULT_TEST && host != null &&
+                host.stopResult != null &&
+                host.stopResult.outcome == VirtualSdGenerationStore.Outcome.RECOVERY_REQUIRED &&
+                reported == null) {
+            // A native close/flush problem is an unresolved *native* outcome,
+            // not the NO_PENDING result used for failure before game start.
+            outcome = VirtualSdGenerationStore.Outcome.RECOVERY_REQUIRED;
+            releaseAdmission = false;
+        }
+        if (BuildConfig.E3_DEVICE_NATIVE_FAULT_TEST && host != null &&
+                host.nativeCloseEvidence != null) {
+            failureMessage = failureMessage == null ? host.nativeCloseEvidence :
+                    failureMessage + "\n" + host.nativeCloseEvidence;
+        }
         if (reported != null && reported.failure != null) {
             String publicationDetail = "Store operation detail: " +
                     String.valueOf(reported.failure.getMessage());
@@ -365,9 +379,16 @@ public final class E3TestActivity extends Activity {
     }
 
     private String readDeviceFaultMode() {
+        String mode = getIntent() == null ? null : getIntent().getStringExtra(FAULT_EXTRA);
+        if (BuildConfig.E3_DEVICE_NATIVE_FAULT_TEST &&
+                ("dev.plump.emulator.e3native".equals(getPackageName()) ||
+                 "dev.plump.emulator.e3close".equals(getPackageName()))) {
+            if ("DLDI_WRITE".equals(mode) || "STREAM_FLUSH".equals(mode) ||
+                    "FILE_CLOSE".equals(mode)) return mode;
+            return MODE_NONE;
+        }
         if (!BuildConfig.E3_DEVICE_FAULT_TEST ||
                 !"dev.plump.emulator.e3fault".equals(getPackageName())) return MODE_NONE;
-        String mode = getIntent() == null ? null : getIntent().getStringExtra(FAULT_EXTRA);
         if (MODE_DENY_LAUNCH.equals(mode) || MODE_DENY_WORKING.equals(mode) ||
                 "BEFORE_HEAD_RENAME".equals(mode) || "AFTER_HEAD_RENAME".equals(mode) ||
                 "DURING_HEAD_DIRECTORY_SYNC".equals(mode) ||
@@ -401,6 +422,7 @@ public final class E3TestActivity extends Activity {
         volatile boolean gameLoaded;
         volatile boolean framesCompleted;
         volatile VirtualSdGenerationStore.TransactionResult transaction;
+        volatile String nativeCloseEvidence;
         private EmulatorSessionOwner.StopResult stopResult;
 
         DiagnosticHost(E3DiagnosticRunCoordinator.RunControl control,
@@ -416,6 +438,11 @@ public final class E3TestActivity extends Activity {
 
         @Override public boolean initializeCore() {
             if (control.cancellationRequested()) return false;
+            if (BuildConfig.E3_DEVICE_NATIVE_FAULT_TEST &&
+                    !NativeDs.configureE3NativeFault(getPackageName(), selectedFault)) {
+                nativeCloseEvidence = "Exact E3 native fault setup refused by package or core state";
+                return false;
+            }
             coreInitializationAttempted = true;
             String issue = NativeDs.initializeE3(systemDirectory.toString(), working.saveDirectory.toString());
             coreInitialized = issue == null;
@@ -461,7 +488,14 @@ public final class E3TestActivity extends Activity {
                 return remember(VirtualSdGenerationStore.Outcome.RECOVERY_REQUIRED, false);
 
             try {
+                if (BuildConfig.E3_DEVICE_NATIVE_FAULT_TEST)
+                    nativeCloseEvidence = "Pre-close native status: " +
+                            nativeStatusSummary(NativeDs.snapshotE3DldiStatus());
                 long[] fields = NativeDs.closeE3Dldi();
+                if (BuildConfig.E3_DEVICE_NATIVE_FAULT_TEST)
+                    nativeCloseEvidence += "\nPost-close native status: " +
+                            nativeStatusSummary(fields == null ?
+                                    NativeDs.snapshotE3DldiStatus() : fields);
                 if (fields == null || fields.length != 22)
                     return remember(VirtualSdGenerationStore.Outcome.RECOVERY_REQUIRED, false);
                 VirtualSdGenerationStore.CoreCloseReceipt receipt = NativeDs.e3Receipt(fields);
@@ -497,6 +531,17 @@ public final class E3TestActivity extends Activity {
             stopResult = new EmulatorSessionOwner.StopResult(outcome, quiesced, true);
             return stopResult;
         }
+    }
+
+    private static String nativeStatusSummary(long[] fields) {
+        if (fields == null || fields.length != 22) return "unavailable";
+        return "state=" + fields[1] + ", firstError=" + fields[2] +
+                ", lastError=" + fields[3] + ", sectorsWritten=" + fields[7] +
+                ", writeFailures=" + fields[9] + ", dldiWriteCalls=" + fields[11] +
+                ", dldiWriteFailures=" + fields[13] + ", dirty=" + fields[16] +
+                ", flushAttempted=" + fields[17] + ", flushSucceeded=" + fields[18] +
+                ", closeAttempted=" + fields[19] + ", closeSucceeded=" + fields[20] +
+                ", closeReturned=" + fields[21];
     }
 
     private void requireTestIdentity() throws IOException {

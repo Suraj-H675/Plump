@@ -25,6 +25,10 @@ final class NativeDs {
     static native String initializeE3(String privateSystemDir, String workingSaveDir);
     /** Quiesced E3 core only. Returns 21 fixed ABI fields plus close() result. */
     static native long[] closeE3Dldi();
+    /** E3 test library only. Refuses any package other than isolated e3native. */
+    static native boolean configureE3NativeFault(String packageName, String mode);
+    /** Non-mutating native DLDI status snapshot; 22nd field means close was not invoked. */
+    static native long[] snapshotE3DldiStatus();
     static native String load(byte[] rom);
     static native void frame();
     static native int serializerCapabilities();

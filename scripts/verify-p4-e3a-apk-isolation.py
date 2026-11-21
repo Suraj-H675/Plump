@@ -90,6 +90,8 @@ def inspect(path, expect_id, expect_label, expect_core, experimental):
     for symbol in (
         "Java_dev_plump_emulator_NativeDs_initializeE3",
         "Java_dev_plump_emulator_NativeDs_closeE3Dldi",
+        "Java_dev_plump_emulator_NativeDs_configureE3NativeFault",
+        "Java_dev_plump_emulator_NativeDs_snapshotE3DldiStatus",
     ):
         exists = bool(re.search(r"\b" + re.escape(symbol) + r"\s*$", elf, re.M))
         if exists != experimental:
