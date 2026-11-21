@@ -22,6 +22,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.zip.GZIPInputStream;
 
 /** E3-only diagnostic UI. All storage and native session work stays on its reserved worker. */
@@ -30,6 +31,10 @@ public final class E3TestActivity extends Activity {
     private static final long PREFLIGHT_BYTES = 768L * 1024 * 1024;
     private static final String CORE_REV = "16f127dbb587a73371827ce79689c5d237c4b59b";
     private static final String FRONTEND_REV = "f394adbacb5722ee97c1b37c8064da9a25818310";
+    private static final String FAULT_EXTRA = "dev.plump.emulator.E3_TEST_FAULT";
+    private static final String MODE_NONE = "NONE";
+    private static final String MODE_DENY_LAUNCH = "DENY_LAUNCH_CAPACITY";
+    private static final String MODE_DENY_WORKING = "DENY_WORKING_COPY_CAPACITY";
 
     private final E3DiagnosticRunCoordinator coordinator = E3DiagnosticRunCoordinator.process();
     private final EmulatorSessionOwner owner = EmulatorSessionOwner.process();
@@ -38,6 +43,7 @@ public final class E3TestActivity extends Activity {
     private Button recover;
     private E3DiagnosticRunCoordinator.RunHandle runHandle;
     private ActivityObserver observer;
+    private String selectedFault = MODE_NONE;
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
@@ -45,6 +51,7 @@ public final class E3TestActivity extends Activity {
             finish();
             return;
         }
+        selectedFault = readDeviceFaultMode();
         LinearLayout layout = new LinearLayout(this);
         layout.setOrientation(LinearLayout.VERTICAL);
         layout.setPadding(28, 38, 28, 28);
@@ -53,7 +60,8 @@ public final class E3TestActivity extends Activity {
                 "Only the embedded CC0 DLDI counter fixture is permitted.\n" +
                 "Each run attempts one genuine write. Unverified generations stay quarantined.\n" +
                 "This build does NOT use or import ordinary Plump data.\n\n" +
-                "Tap Run only during the separately authorized device test.");
+                "Tap Run only during the separately authorized device test.\n" +
+                "Fault injection: " + selectedFault);
         run = new Button(this);
         run.setText("Run isolated diagnostic once");
         run.setOnClickListener(view -> startDiagnostic());
@@ -158,6 +166,14 @@ public final class E3TestActivity extends Activity {
         boolean ownerAttachmentFailed = false;
         boolean authorityUncertain = false;
         long previousCounter = -1;
+        // Fault modes are allowed only in the separately installed disposable package.
+        // The one-shot fault hook is armed after a verified baseline and real native
+        // frame execution, never during baseline construction or another app's run.
+        final String faultMode = selectedFault;
+        final AtomicBoolean workingCapacityFaultArmed = new AtomicBoolean(false);
+        final AtomicBoolean commitFaultArmed = new AtomicBoolean(false);
+        final AtomicBoolean commitFaultFired = new AtomicBoolean(false);
+        final VirtualSdGenerationStore.FaultPoint requestedCommitFault = commitFaultPoint(faultMode);
 
         try {
             control.checkpoint(E3DiagnosticRunCoordinator.Phase.PREFLIGHT);
@@ -168,8 +184,12 @@ public final class E3TestActivity extends Activity {
             Path privateRoot = getFilesDir().toPath().toRealPath();
             if (!privateRoot.startsWith(getDataDir().toPath().toRealPath()))
                 throw new IOException("Experimental storage is not within this app's private data");
-            StorageCapacity capacity = StorageCapacity.withAllocationPreflight(
-                    path -> new StatFs(path.toString()).getAvailableBytes(), this::allocatableBytes);
+            StorageCapacity capacity = StorageCapacity.withAllocationPreflight(path -> {
+                if (MODE_DENY_LAUNCH.equals(faultMode) ||
+                        (MODE_DENY_WORKING.equals(faultMode) && workingCapacityFaultArmed.get()))
+                    return 0;
+                return new StatFs(path.toString()).getAvailableBytes();
+            }, this::allocatableBytes);
             capacity.require(privateRoot, PREFLIGHT_BYTES, "128 MiB snapshots plus rollback margin");
             control.checkCancelled();
 
@@ -186,7 +206,11 @@ public final class E3TestActivity extends Activity {
             store = new VirtualSdGenerationStore(
                     base.resolve("rom-" + E3DiagnosticFatRecord.ROM_SHA256).resolve("canonical"),
                     identity, "canonical", IMAGE_BYTES, this::syncDirectory,
-                    new VirtualSdFat16Validator(), point -> { }, capacity);
+                    new VirtualSdFat16Validator(), point -> {
+                        if (commitFaultArmed.get() && requestedCommitFault == point &&
+                                commitFaultFired.compareAndSet(false, true))
+                            throw new IOException("E3 device fault injected at " + point);
+                    }, capacity);
 
             control.checkpoint(E3DiagnosticRunCoordinator.Phase.BASELINE);
             try { oldHead = store.currentForWrite(); }
@@ -214,6 +238,7 @@ public final class E3TestActivity extends Activity {
             previousCounter = E3DiagnosticFatRecord.read(oldHead.imageFile, oldHead.sequence > 1).counter;
 
             control.checkpoint(E3DiagnosticRunCoordinator.Phase.WORKING_COPY);
+            if (MODE_DENY_WORKING.equals(faultMode)) workingCapacityFaultArmed.set(true);
             working = store.openSession(control);
             control.checkCancelled();
 
@@ -270,6 +295,7 @@ public final class E3TestActivity extends Activity {
                 throw new IOException("E3 frame execution stopped before the approved boundary");
             } else {
                 control.checkpoint(E3DiagnosticRunCoordinator.Phase.COMMIT);
+                if (requestedCommitFault != null) commitFaultArmed.set(true);
                 boolean paused = owner.pause(hostToken);
                 EmulatorSessionOwner.StopResult stop = owner.lastStopResult(hostToken);
                 publication = host.transaction;
@@ -322,6 +348,12 @@ public final class E3TestActivity extends Activity {
         VirtualSdGenerationStore.Outcome outcome = authorityUncertain
                 ? VirtualSdGenerationStore.Outcome.RECOVERY_REQUIRED : reported == null
                 ? VirtualSdGenerationStore.Outcome.NO_PENDING : reported.outcome;
+        if (reported != null && reported.failure != null) {
+            String publicationDetail = "Store operation detail: " +
+                    String.valueOf(reported.failure.getMessage());
+            failureMessage = failureMessage == null ? publicationDetail :
+                    failureMessage + "\n" + publicationDetail;
+        }
         VirtualSdGenerationStore.TransactionIdentity transaction = reported == null ? null : reported.identity;
         VirtualSdGenerationStore.Generation generation = reported == null ? null : reported.generation;
         if (outcome == VirtualSdGenerationStore.Outcome.RECOVERY_REQUIRED ||
@@ -330,6 +362,29 @@ public final class E3TestActivity extends Activity {
                 baselinePublication, failureMessage, releaseAdmission);
         return new E3DiagnosticRunCoordinator.RunResult(outcome, transaction, generation,
                 message, releaseAdmission);
+    }
+
+    private String readDeviceFaultMode() {
+        if (!BuildConfig.E3_DEVICE_FAULT_TEST ||
+                !"dev.plump.emulator.e3fault".equals(getPackageName())) return MODE_NONE;
+        String mode = getIntent() == null ? null : getIntent().getStringExtra(FAULT_EXTRA);
+        if (MODE_DENY_LAUNCH.equals(mode) || MODE_DENY_WORKING.equals(mode) ||
+                "BEFORE_HEAD_RENAME".equals(mode) || "AFTER_HEAD_RENAME".equals(mode) ||
+                "DURING_HEAD_DIRECTORY_SYNC".equals(mode) ||
+                "AFTER_HEAD_DIRECTORY_SYNC".equals(mode)) return mode;
+        return MODE_NONE;
+    }
+
+    private static VirtualSdGenerationStore.FaultPoint commitFaultPoint(String mode) {
+        switch (mode) {
+            case "BEFORE_HEAD_RENAME": return VirtualSdGenerationStore.FaultPoint.BEFORE_HEAD_RENAME;
+            case "AFTER_HEAD_RENAME": return VirtualSdGenerationStore.FaultPoint.AFTER_HEAD_RENAME;
+            case "DURING_HEAD_DIRECTORY_SYNC":
+                return VirtualSdGenerationStore.FaultPoint.DURING_HEAD_DIRECTORY_SYNC;
+            case "AFTER_HEAD_DIRECTORY_SYNC":
+                return VirtualSdGenerationStore.FaultPoint.AFTER_HEAD_DIRECTORY_SYNC;
+            default: return null;
+        }
     }
 
     private final class DiagnosticHost implements EmulatorSessionOwner.Host {
