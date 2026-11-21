@@ -6,6 +6,14 @@ plugins {
 // native core cannot become authorized merely by updating its SHA receipt.
 def verifiedE3CoreSha = '9e7a84190385b8aa526f17ffcbbbd2f709d8b1ec3dfc608aa34cb8d6bbeba5f9'
 def verifiedE3BaselineSha = '14788027f3601eafd227b15fd1ce50563f134d82ba47d3746b5f72d84539bd8e'
+// The old disposable installation has already completed its three-write limit.
+// Permit only named throwaway test identities; never alias production or E3B.
+def e3DisposablePackage = providers.gradleProperty('plumpE3DisposablePackage')
+        .orElse('dev.plump.emulator.e3interrupt').get()
+if (!(e3DisposablePackage in ['dev.plump.emulator.e3interrupt',
+                             'dev.plump.emulator.e3rotate'])) {
+    throw new GradleException('Unapproved E3 disposable package identity')
+}
 
 android {
     namespace 'dev.plump.emulator'
@@ -53,10 +61,10 @@ android {
         // Disposable E3C-only package, never an upgrade to accepted E3B data.
         e3interrupt {
             dimension 'mode'
-            applicationId 'dev.plump.emulator.e3interrupt'
+            applicationId e3DisposablePackage
             versionNameSuffix '-e3c-disposable'
             buildConfigField 'boolean', 'E3_TEST', 'true'
-            buildConfigField 'String', 'E3_EXPECTED_PACKAGE', '"dev.plump.emulator.e3interrupt"'
+            buildConfigField 'String', 'E3_EXPECTED_PACKAGE', '"' + e3DisposablePackage + '"'
             buildConfigField 'String', 'E3_CORE_SHA256', '"' + verifiedE3CoreSha + '"'
             buildConfigField 'String', 'E3_BASELINE_SHA256', '"' + verifiedE3BaselineSha + '"'
             externalNativeBuild {
