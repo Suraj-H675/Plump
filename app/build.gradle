@@ -16,7 +16,8 @@ def e3DisposablePackage = providers.gradleProperty('plumpE3DisposablePackage')
 if (!(e3DisposablePackage in ['dev.plump.emulator.e3interrupt',
                              'dev.plump.emulator.e3rotate',
                              'dev.plump.emulator.e3fault',
-                             'dev.plump.emulator.e3native'])) {
+                             'dev.plump.emulator.e3native',
+                             'dev.plump.emulator.e3sync'])) {
     throw new GradleException('Unapproved E3 disposable package identity')
 }
 
@@ -71,7 +72,7 @@ android {
             applicationId e3DisposablePackage
             versionNameSuffix '-e3c-disposable'
             buildConfigField 'boolean', 'E3_TEST', 'true'
-            buildConfigField 'boolean', 'E3_DEVICE_FAULT_TEST', (e3DisposablePackage == 'dev.plump.emulator.e3fault').toString()
+            buildConfigField 'boolean', 'E3_DEVICE_FAULT_TEST', (e3DisposablePackage in ['dev.plump.emulator.e3fault', 'dev.plump.emulator.e3sync']).toString()
             buildConfigField 'boolean', 'E3_DEVICE_NATIVE_FAULT_TEST', (e3DisposablePackage == 'dev.plump.emulator.e3native').toString()
             buildConfigField 'String', 'E3_EXPECTED_PACKAGE', '"' + e3DisposablePackage + '"'
             buildConfigField 'String', 'E3_CORE_SHA256', '"' + verifiedE3CoreSha + '"'

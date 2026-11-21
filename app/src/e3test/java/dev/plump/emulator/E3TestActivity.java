@@ -35,6 +35,10 @@ public final class E3TestActivity extends Activity {
     private static final String MODE_NONE = "NONE";
     private static final String MODE_DENY_LAUNCH = "DENY_LAUNCH_CAPACITY";
     private static final String MODE_DENY_WORKING = "DENY_WORKING_COPY_CAPACITY";
+    // E3G only: simulated ErrnoException(EIO) at the real Android directory
+    // sync callback, after successful HEAD rename. This does not fail a real
+    // kernel fsync syscall and must never be described as doing so.
+    private static final String MODE_SIMULATED_FSYNC_EIO = "SIMULATED_FSYNC_EIO";
 
     private final E3DiagnosticRunCoordinator coordinator = E3DiagnosticRunCoordinator.process();
     private final EmulatorSessionOwner owner = EmulatorSessionOwner.process();
@@ -173,6 +177,7 @@ public final class E3TestActivity extends Activity {
         final AtomicBoolean workingCapacityFaultArmed = new AtomicBoolean(false);
         final AtomicBoolean commitFaultArmed = new AtomicBoolean(false);
         final AtomicBoolean commitFaultFired = new AtomicBoolean(false);
+        final AtomicBoolean headSyncEioPending = new AtomicBoolean(false);
         final VirtualSdGenerationStore.FaultPoint requestedCommitFault = commitFaultPoint(faultMode);
 
         try {
@@ -203,10 +208,29 @@ public final class E3TestActivity extends Activity {
             CheckpointStore.Identity identity = new CheckpointStore.Identity(
                     "ds", E3DiagnosticFatRecord.ROM_SHA256, "melondsds-libretro",
                     CORE_REV, FRONTEND_REV, BuildConfig.E3_CORE_SHA256, "arm64-v8a", 1);
+            Path canonicalRoot = base.resolve("rom-" + E3DiagnosticFatRecord.ROM_SHA256)
+                    .resolve("canonical").toAbsolutePath().normalize();
             store = new VirtualSdGenerationStore(
-                    base.resolve("rom-" + E3DiagnosticFatRecord.ROM_SHA256).resolve("canonical"),
-                    identity, "canonical", IMAGE_BYTES, this::syncDirectory,
+                    canonicalRoot,
+                    identity, "canonical", IMAGE_BYTES, directory -> {
+                        if (E3SyncFaultPolicy.shouldArmSyntheticEio(
+                                    BuildConfig.E3_DEVICE_FAULT_TEST, getPackageName(), faultMode) &&
+                                headSyncEioPending.compareAndSet(true, false)) {
+                            if (!canonicalRoot.equals(directory.toAbsolutePath().normalize()))
+                                throw new IOException("E3G refused a sync fault outside the canonical HEAD directory");
+                            throw simulatedAndroidDirectoryFsyncEio(directory);
+                        }
+                        syncDirectory(directory);
+                    },
                     new VirtualSdFat16Validator(), point -> {
+                        if (E3SyncFaultPolicy.shouldArmSyntheticEio(
+                                    BuildConfig.E3_DEVICE_FAULT_TEST, getPackageName(), faultMode) &&
+                                point == VirtualSdGenerationStore.FaultPoint.DURING_HEAD_DIRECTORY_SYNC &&
+                                commitFaultArmed.get() &&
+                                commitFaultFired.compareAndSet(false, true)) {
+                            headSyncEioPending.set(true);
+                            return;
+                        }
                         if (commitFaultArmed.get() && requestedCommitFault == point &&
                                 commitFaultFired.compareAndSet(false, true))
                             throw new IOException("E3 device fault injected at " + point);
@@ -295,7 +319,12 @@ public final class E3TestActivity extends Activity {
                 throw new IOException("E3 frame execution stopped before the approved boundary");
             } else {
                 control.checkpoint(E3DiagnosticRunCoordinator.Phase.COMMIT);
-                if (requestedCommitFault != null) commitFaultArmed.set(true);
+                // A synthetic directory-callback errno has no FaultPoint that
+                // throws directly: it still must arm its one-shot commit gate.
+                if (requestedCommitFault != null ||
+                        E3SyncFaultPolicy.shouldArmSyntheticEio(
+                                BuildConfig.E3_DEVICE_FAULT_TEST, getPackageName(), faultMode))
+                    commitFaultArmed.set(true);
                 boolean paused = owner.pause(hostToken);
                 EmulatorSessionOwner.StopResult stop = owner.lastStopResult(hostToken);
                 publication = host.transaction;
@@ -368,6 +397,12 @@ public final class E3TestActivity extends Activity {
             failureMessage = failureMessage == null ? publicationDetail :
                     failureMessage + "\n" + publicationDetail;
         }
+        if (E3SyncFaultPolicy.shouldArmSyntheticEio(
+                BuildConfig.E3_DEVICE_FAULT_TEST, getPackageName(), faultMode) &&
+                !commitFaultFired.get()) {
+            String omitted = "E3G FAULT NOT EXECUTED: synthetic directory-sync EIO gate was not reached";
+            failureMessage = failureMessage == null ? omitted : failureMessage + "\n" + omitted;
+        }
         VirtualSdGenerationStore.TransactionIdentity transaction = reported == null ? null : reported.identity;
         VirtualSdGenerationStore.Generation generation = reported == null ? null : reported.generation;
         if (outcome == VirtualSdGenerationStore.Outcome.RECOVERY_REQUIRED ||
@@ -388,7 +423,10 @@ public final class E3TestActivity extends Activity {
             return MODE_NONE;
         }
         if (!BuildConfig.E3_DEVICE_FAULT_TEST ||
-                !"dev.plump.emulator.e3fault".equals(getPackageName())) return MODE_NONE;
+                !("dev.plump.emulator.e3fault".equals(getPackageName()) ||
+                  "dev.plump.emulator.e3sync".equals(getPackageName()))) return MODE_NONE;
+        if ("dev.plump.emulator.e3sync".equals(getPackageName()) &&
+                MODE_SIMULATED_FSYNC_EIO.equals(mode)) return mode;
         if (MODE_DENY_LAUNCH.equals(mode) || MODE_DENY_WORKING.equals(mode) ||
                 "BEFORE_HEAD_RENAME".equals(mode) || "AFTER_HEAD_RENAME".equals(mode) ||
                 "DURING_HEAD_DIRECTORY_SYNC".equals(mode) ||
@@ -715,6 +753,23 @@ public final class E3TestActivity extends Activity {
             throw new IOException("E3 private-directory durability sync unavailable", failure);
         } finally {
             if (fd != null) try { Os.close(fd); } catch (android.system.ErrnoException ignored) { }
+        }
+    }
+
+    /** Test-only E3G simulation of a failed Os.fsync, with no real fsync fault. */
+    private static IOException simulatedAndroidDirectoryFsyncEio(Path directory) {
+        FileDescriptor fd = null;
+        try {
+            // Open the real Android private directory, but deliberately do NOT
+            // invoke fsync: a deterministic synthetic EIO is returned instead.
+            fd = Os.open(directory.toString(), OsConstants.O_RDONLY, 0);
+            return new IOException("E3G simulated Android Os.fsync EIO after canonical HEAD rename",
+                    new android.system.ErrnoException("fsync", OsConstants.EIO));
+        } catch (android.system.ErrnoException openFailure) {
+            return new IOException("E3G canonical HEAD directory open failed", openFailure);
+        } finally {
+            if (fd != null) try { Os.close(fd); }
+                catch (android.system.ErrnoException ignored) { }
         }
     }
 
