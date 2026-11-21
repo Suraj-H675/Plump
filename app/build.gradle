@@ -26,6 +26,7 @@ android {
             }
         }
         buildConfigField 'boolean', 'E3_TEST', 'false'
+        buildConfigField 'String', 'E3_EXPECTED_PACKAGE', '""'
         buildConfigField 'String', 'E3_CORE_SHA256', '""'
         buildConfigField 'String', 'E3_BASELINE_SHA256', '""'
     }
@@ -41,9 +42,23 @@ android {
             applicationId 'dev.plump.emulator.e3test'
             versionNameSuffix '-e3a-isolated'
             buildConfigField 'boolean', 'E3_TEST', 'true'
+            buildConfigField 'String', 'E3_EXPECTED_PACKAGE', '"dev.plump.emulator.e3test"'
             buildConfigField 'String', 'E3_CORE_SHA256', '"' + verifiedE3CoreSha + '"'
             buildConfigField 'String', 'E3_BASELINE_SHA256', '"' + verifiedE3BaselineSha + '"'
             // Only the E3 test host enables this; production C++ omits it.
+            externalNativeBuild {
+                cmake { cppFlags '-DPLUMP_E3_DLDI_TEST=1' }
+            }
+        }
+        // Disposable E3C-only package, never an upgrade to accepted E3B data.
+        e3interrupt {
+            dimension 'mode'
+            applicationId 'dev.plump.emulator.e3interrupt'
+            versionNameSuffix '-e3c-disposable'
+            buildConfigField 'boolean', 'E3_TEST', 'true'
+            buildConfigField 'String', 'E3_EXPECTED_PACKAGE', '"dev.plump.emulator.e3interrupt"'
+            buildConfigField 'String', 'E3_CORE_SHA256', '"' + verifiedE3CoreSha + '"'
+            buildConfigField 'String', 'E3_BASELINE_SHA256', '"' + verifiedE3BaselineSha + '"'
             externalNativeBuild {
                 cmake { cppFlags '-DPLUMP_E3_DLDI_TEST=1' }
             }
@@ -56,6 +71,11 @@ android {
         main { jniLibs.srcDirs = [] }
         production { jniLibs.srcDirs = ['src/main/jniLibs'] }
         e3test {
+            jniLibs.srcDirs = ['build/e3test-core/jniLibs']
+            assets.srcDirs = ['build/e3test-core/assets']
+        }
+        e3interrupt {
+            java.srcDirs = ['src/e3test/java']
             jniLibs.srcDirs = ['build/e3test-core/jniLibs']
             assets.srcDirs = ['build/e3test-core/assets']
         }
@@ -155,7 +175,11 @@ tasks.configureEach {
     if (name == 'mergeE3testDebugJniLibFolders' ||
             name == 'mergeE3testReleaseJniLibFolders' ||
             name == 'mergeE3testDebugAssets' ||
-            name == 'mergeE3testReleaseAssets') {
+            name == 'mergeE3testReleaseAssets' ||
+            name == 'mergeE3interruptDebugJniLibFolders' ||
+            name == 'mergeE3interruptReleaseJniLibFolders' ||
+            name == 'mergeE3interruptDebugAssets' ||
+            name == 'mergeE3interruptReleaseAssets') {
         dependsOn tasks.named('verifyAndStageE3TestInputs')
     }
 }

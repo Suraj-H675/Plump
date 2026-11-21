@@ -41,7 +41,7 @@ public final class E3TestActivity extends Activity {
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
-        if (!BuildConfig.E3_TEST || !"dev.plump.emulator.e3test".equals(getPackageName())) {
+        if (!BuildConfig.E3_TEST || !BuildConfig.E3_EXPECTED_PACKAGE.equals(getPackageName())) {
             finish();
             return;
         }
@@ -445,7 +445,7 @@ public final class E3TestActivity extends Activity {
     }
 
     private void requireTestIdentity() throws IOException {
-        if (!BuildConfig.E3_TEST || !"dev.plump.emulator.e3test".equals(getPackageName()))
+        if (!BuildConfig.E3_TEST || !BuildConfig.E3_EXPECTED_PACKAGE.equals(getPackageName()))
             throw new IOException("E3 identity check failed");
     }
 
@@ -475,7 +475,8 @@ public final class E3TestActivity extends Activity {
         if (failure != null) text.append(failure).append('\n');
         if (!releaseAdmission)
             text.append("Native or storage cleanup is unresolved. This process remains blocked; cold recovery is required.\n");
-        text.append("Storage is private to dev.plump.emulator.e3test. Physical Android power-loss durability is unverified.");
+        text.append("Storage is private to ").append(getPackageName())
+                .append(". Physical Android power-loss durability is unverified.");
         return text.toString();
     }
 
