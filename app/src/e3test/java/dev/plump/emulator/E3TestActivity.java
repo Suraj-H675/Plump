@@ -2,6 +2,7 @@ package dev.plump.emulator;
 
 import android.app.Activity;
 import android.os.Bundle;
+import android.os.StatFs;
 import android.os.storage.StorageManager;
 import android.system.Os;
 import android.system.OsConstants;
@@ -90,7 +91,11 @@ public final class E3TestActivity extends Activity {
             Path privateRoot = getFilesDir().toPath().toRealPath();
             if (!privateRoot.startsWith(getDataDir().toPath().toRealPath()))
                 throw new IOException("Experimental storage is not within this app's private data");
-            preflight(privateRoot);
+            StorageCapacity capacity = StorageCapacity.withAllocationPreflight(
+                    path -> new StatFs(path.toString()).getAvailableBytes(),
+                    this::allocatableBytes);
+            capacity.require(privateRoot, PREFLIGHT_BYTES,
+                    "128 MiB snapshots plus rollback margin");
 
             Path base = privateRoot.resolve("e3-only");
             Files.createDirectories(base);
@@ -102,7 +107,7 @@ public final class E3TestActivity extends Activity {
             store = new VirtualSdGenerationStore(
                     base.resolve("rom-" + E3DiagnosticFatRecord.ROM_SHA256).resolve("canonical"),
                     identity, "canonical", IMAGE_BYTES,
-                    this::syncDirectory, new VirtualSdFat16Validator(), point -> { });
+                    this::syncDirectory, new VirtualSdFat16Validator(), point -> { }, capacity);
             VirtualSdGenerationStore.Generation head = store.current();
             if (head == null) head = store.initialize(seed);
             if (head.sequence >= 4)
@@ -266,14 +271,13 @@ public final class E3TestActivity extends Activity {
         }
     }
 
-    private void preflight(Path dir) throws IOException {
-        long free = Files.getFileStore(dir).getUsableSpace();
-        if (free < PREFLIGHT_BYTES)
-            throw new IOException("Insufficient app-private space for 128 MiB snapshots plus rollback margin");
+    private long allocatableBytes(Path dir) throws IOException {
+        // Both StorageManager APIs are public from API 26 (our minSdk).
+        // A missing service, denied query or unsupported volume fails closed.
         StorageManager storage = getSystemService(StorageManager.class);
-        if (storage == null || storage.getAllocatableBytes(storage.getUuidForPath(dir.toFile())) <
-                PREFLIGHT_BYTES)
-            throw new IOException("Android storage allocation preflight rejected E3 snapshots");
+        if (storage == null)
+            throw new IOException("Android storage allocation service unavailable");
+        return storage.getAllocatableBytes(storage.getUuidForPath(dir.toFile()));
     }
 
     private byte[] verifiedFixture() throws IOException {

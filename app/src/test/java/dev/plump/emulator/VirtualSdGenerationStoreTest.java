@@ -251,6 +251,71 @@ public final class VirtualSdGenerationStoreTest {
         }
     }
 
+    @Test public void insufficientOrUnavailableCapacityRejectsBootstrapWithoutPublishing() throws Exception {
+        Path root = temporary.newFolder().toPath();
+        Path baseline = createImage(root.resolve("base.img"), 31);
+        String sourceSha = sha(baseline);
+        long[] physical = { IMAGE_BYTES - 1 };
+        long[] allocatable = { IMAGE_BYTES };
+        boolean[] unavailable = { false };
+        StorageCapacity capacity = StorageCapacity.withAllocationPreflight(path -> {
+            if (unavailable[0]) throw new SecurityException("capacity denied");
+            return physical[0];
+        }, path -> allocatable[0]);
+        Path storeRoot = root.resolve("canonical");
+        VirtualSdGenerationStore store = new VirtualSdGenerationStore(storeRoot, IDENTITY,
+                "canonical", IMAGE_BYTES, VirtualSdGenerationStoreTest::syncDirectory,
+                VirtualSdGenerationStoreTest::validateImage, ignored -> { }, capacity);
+        for (int attempt = 0; attempt < 3; attempt++) {
+            if (attempt == 1) { physical[0] = IMAGE_BYTES; allocatable[0] = 0; }
+            if (attempt == 2) { unavailable[0] = true; allocatable[0] = IMAGE_BYTES; }
+            try { store.initialize(baseline); fail("Unexpected bootstrap publication"); }
+            catch (IOException expected) { assertTrue(expected.getMessage().contains("capacity")); }
+            assertNull(store.current());
+            assertEquals(0, countChildren(storeRoot.resolve("generations")));
+            assertEquals(0, countChildren(storeRoot.resolve("working")));
+            assertEquals(sourceSha, sha(baseline));
+        }
+        unavailable[0] = false;
+        assertEquals(1, store.initialize(baseline).sequence);
+    }
+
+    @Test public void workingCopyCapacityIsRecheckedAndRejectionPreservesHeadAndReleasesLock() throws Exception {
+        Path root = temporary.newFolder().toPath();
+        Path storeRoot = root.resolve("canonical");
+        long[] physical = { IMAGE_BYTES };
+        long[] allocatable = { IMAGE_BYTES };
+        boolean[] unavailable = { false };
+        StorageCapacity capacity = StorageCapacity.withAllocationPreflight(
+                path -> physical[0], path -> {
+                    if (unavailable[0]) throw new IOException("allocation unavailable");
+                    return allocatable[0];
+                });
+        VirtualSdGenerationStore store = new VirtualSdGenerationStore(storeRoot, IDENTITY,
+                "canonical", IMAGE_BYTES, VirtualSdGenerationStoreTest::syncDirectory,
+                VirtualSdGenerationStoreTest::validateImage, ignored -> { }, capacity);
+        VirtualSdGenerationStore.Generation first = store.initialize(createImage(root.resolve("base.img"), 41));
+        byte[] head = Files.readAllBytes(storeRoot.resolve("HEAD.1"));
+        for (int attempt = 0; attempt < 3; attempt++) {
+            physical[0] = attempt == 0 ? IMAGE_BYTES - 1 : IMAGE_BYTES;
+            allocatable[0] = attempt == 1 ? IMAGE_BYTES - 1 : IMAGE_BYTES;
+            unavailable[0] = attempt == 2;
+            try { store.openSession(); fail("Unexpected working image"); }
+            catch (IOException expected) { assertTrue(expected.getMessage().contains("capacity")); }
+            assertEquals(first.id, store.current().id);
+            assertArrayEquals(head, Files.readAllBytes(storeRoot.resolve("HEAD.1")));
+            assertFalse(Files.exists(storeRoot.resolve("HEAD.0")));
+            assertEquals(first.imageSha256, sha(first.imageFile));
+            assertEquals(1, countChildren(storeRoot.resolve("generations")));
+            assertEquals(0, countChildren(storeRoot.resolve("working")));
+        }
+        unavailable[0] = false;
+        try (VirtualSdGenerationStore.WorkingSession session = store.openSession()) {
+            assertEquals(first.imageSha256, sha(session.imageFile));
+        }
+        assertEquals(first.id, store.current().id);
+    }
+
     private static VirtualSdGenerationStore store(Path root, String branchId,
                                                    VirtualSdGenerationStore.FaultInjector faults) {
         return new VirtualSdGenerationStore(root, IDENTITY, branchId, IMAGE_BYTES,

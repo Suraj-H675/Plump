@@ -208,17 +208,26 @@ final class VirtualSdGenerationStore {
     private final DirectorySync directorySync;
     private final ImageValidator imageValidator;
     private final FaultInjector faultInjector;
+    private final StorageCapacity capacity;
 
     VirtualSdGenerationStore(Path root, CheckpointStore.Identity identity, String branchId,
                              long maxImageBytes, DirectorySync directorySync,
                              ImageValidator imageValidator, FaultInjector faultInjector) {
+        this(root, identity, branchId, maxImageBytes, directorySync, imageValidator,
+                faultInjector, StorageCapacity.host());
+    }
+
+    VirtualSdGenerationStore(Path root, CheckpointStore.Identity identity, String branchId,
+                             long maxImageBytes, DirectorySync directorySync,
+                             ImageValidator imageValidator, FaultInjector faultInjector,
+                             StorageCapacity capacity) {
         if (identity == null || !"ds".equals(identity.console))
             throw new IllegalArgumentException("Virtual SD generations require a DS identity");
         if (branchId == null || !("canonical".equals(branchId) || isUuid(branchId)))
             throw new IllegalArgumentException("Invalid virtual-SD branch identity");
         if (maxImageBytes < 512 || maxImageBytes % 512 != 0)
             throw new IllegalArgumentException("Invalid bounded virtual-SD image size");
-        if (directorySync == null || imageValidator == null || faultInjector == null)
+        if (directorySync == null || imageValidator == null || faultInjector == null || capacity == null)
             throw new IllegalArgumentException("Virtual-SD durability collaborators are required");
         this.root = root.toAbsolutePath().normalize();
         this.generationsDirectory = this.root.resolve("generations");
@@ -230,6 +239,7 @@ final class VirtualSdGenerationStore {
         this.directorySync = directorySync;
         this.imageValidator = imageValidator;
         this.faultInjector = faultInjector;
+        this.capacity = capacity;
     }
 
     synchronized Generation initialize(Path preformattedImage) throws IOException {
@@ -251,8 +261,7 @@ final class VirtualSdGenerationStore {
             requireRegularFile(source);
             long imageBytes = Files.size(source);
             validateImageBounds(imageBytes);
-            if (Files.getFileStore(root).getUsableSpace() < imageBytes)
-                throw new IOException("Insufficient free space for the immutable virtual-SD baseline");
+            capacity.require(root, imageBytes, "the immutable virtual-SD baseline");
             imageValidator.validate(source);
 
             String generationId = UUID.randomUUID().toString();
@@ -290,8 +299,7 @@ final class VirtualSdGenerationStore {
             Generation base = readCurrentLocked();
             if (base == null) throw new IOException("Virtual-SD store has no committed baseline");
             quarantineAbandonedWorking();
-            if (Files.getFileStore(root).getUsableSpace() < base.imageBytes)
-                throw new IOException("Insufficient free space for an isolated virtual-SD working image");
+            capacity.require(root, base.imageBytes, "an isolated virtual-SD working image");
 
             String sessionId = UUID.randomUUID().toString();
             Path directory = workingDirectory.resolve("session-" + sessionId);
