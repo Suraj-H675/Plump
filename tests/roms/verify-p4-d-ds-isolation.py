@@ -10,7 +10,8 @@ from importlib.machinery import SourceFileLoader
 
 REPO = Path(__file__).resolve().parents[2]
 WORK = Path(os.environ['PLUMP_P4_D_WORK']).resolve() / 'ds'
-CORE = REPO / 'app/build/p3-melonds-host/src/libretro/melondsds_libretro.so'
+CORE = Path(os.environ.get('PLUMP_P4_LEGACY_DS_CORE',
+                           str(REPO / 'app/build/p3-melonds-host/src/libretro/melondsds_libretro.so')))
 ROM = REPO / 'app/build/p3-native-save-diagnostic/p3_save_diagnostic.nds'
 SHA = hashlib.sha256(ROM.read_bytes()).hexdigest()
 JAVACLASSES = Path(os.environ['PLUMP_P4_D_JAVA_CLASSES']).resolve()

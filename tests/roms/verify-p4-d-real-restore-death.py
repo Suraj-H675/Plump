@@ -8,7 +8,9 @@ repo=Path.cwd()
 con=sys.argv[1];point=sys.argv[2];root=Path(sys.argv[3]);source=Path(sys.argv[4])
 if con not in ('gba','ds'):raise AssertionError(con)
 M=SourceFileLoader('p4c',str(repo/'tests/roms/verify-p4-c-checkpoint.py')).load_module()
-core=repo/('app/build/p4-a-work/mgba-host/mgba_libretro.so' if con=='gba' else 'app/build/p3-melonds-host/src/libretro/melondsds_libretro.so')
+core=(repo/'app/build/p4-a-work/mgba-host/mgba_libretro.so') if con=='gba' else Path(
+    os.environ.get('PLUMP_P4_LEGACY_DS_CORE',
+                   str(repo/'app/build/p3-melonds-host/src/libretro/melondsds_libretro.so')))
 rom=(source.parent/'gba-button-sram.gba') if con=='gba' else repo/'app/build/p3-native-save-diagnostic/p3_save_diagnostic.nds'
 if con=='gba':
  import hashlib

@@ -4,7 +4,7 @@
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 work="$root/app/build/p4-br-ds-reload"
-core="$root/app/build/p3-melonds-host/src/libretro/melondsds_libretro.so"
+core="${PLUMP_P4_LEGACY_DS_CORE:-$root/app/build/p3-melonds-host/src/libretro/melondsds_libretro.so}"
 rom1="$root/app/build/p3-input-diagnostic/p3_input_diagnostic.nds"
 rom2="$root/app/build/p3-native-save-diagnostic/p3_save_diagnostic.nds"
 saved="$root/app/build/p4-b-native-crash-review/fixture/saved-sram.bin"

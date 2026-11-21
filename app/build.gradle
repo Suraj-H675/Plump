@@ -2,10 +2,16 @@ plugins {
     id 'com.android.application'
 }
 
+// Immutable, independently verified E3A candidate identities. A modified
+// native core cannot become authorized merely by updating its SHA receipt.
+def verifiedE3CoreSha = '9e7a84190385b8aa526f17ffcbbbd2f709d8b1ec3dfc608aa34cb8d6bbeba5f9'
+def verifiedE3BaselineSha = '14788027f3601eafd227b15fd1ce50563f134d82ba47d3746b5f72d84539bd8e'
+
 android {
     namespace 'dev.plump.emulator'
     compileSdk 35
     ndkVersion '28.2.13676358'
+    buildFeatures { buildConfig true }
 
     defaultConfig {
         applicationId 'dev.plump.emulator'
@@ -18,6 +24,40 @@ android {
             cmake {
                 cppFlags '-std=c++17 -Wall -Wextra'
             }
+        }
+        buildConfigField 'boolean', 'E3_TEST', 'false'
+        buildConfigField 'String', 'E3_CORE_SHA256', '""'
+        buildConfigField 'String', 'E3_BASELINE_SHA256', '""'
+    }
+
+    flavorDimensions 'mode'
+    productFlavors {
+        production {
+            dimension 'mode'
+            applicationId 'dev.plump.emulator'
+        }
+        e3test {
+            dimension 'mode'
+            applicationId 'dev.plump.emulator.e3test'
+            versionNameSuffix '-e3a-isolated'
+            buildConfigField 'boolean', 'E3_TEST', 'true'
+            buildConfigField 'String', 'E3_CORE_SHA256', '"' + verifiedE3CoreSha + '"'
+            buildConfigField 'String', 'E3_BASELINE_SHA256', '"' + verifiedE3BaselineSha + '"'
+            // Only the E3 test host enables this; production C++ omits it.
+            externalNativeBuild {
+                cmake { cppFlags '-DPLUMP_E3_DLDI_TEST=1' }
+            }
+        }
+    }
+    // The existing accepted production core files never change or get
+    // overwritten. The experimental flavor uses a separately verified,
+    // build-only staged native-library directory.
+    sourceSets {
+        main { jniLibs.srcDirs = [] }
+        production { jniLibs.srcDirs = ['src/main/jniLibs'] }
+        e3test {
+            jniLibs.srcDirs = ['build/e3test-core/jniLibs']
+            assets.srcDirs = ['build/e3test-core/assets']
         }
     }
 
@@ -48,6 +88,75 @@ android {
             doFirst { testTemp.mkdirs() }
             systemProperty 'java.io.tmpdir', testTemp.absolutePath
         }
+    }
+}
+
+// No experimental APK is permitted to package an absent or unverified E2
+// core. This task refuses a mismatched ELF instead of falling back to the
+// ordinary production melonDS binary.
+def experimentalCore = file('build/p4-e3a/libmelondsds_libretro.so')
+def experimentalCoreDigest = file('build/p4-e3a/android-core.sha256')
+def experimentalFixture = file('build/p4-e1-b/rom-alpha/plump_e1b_alpha.nds')
+def experimentalBaseline = file('build/p4-e3a/baseline/dldi_sd_card.bin')
+def experimentalBaselineDigest = file('build/p4-e3a/baseline.sha256')
+def experimentalStaged = file('build/e3test-core')
+tasks.register('verifyAndStageE3TestInputs') {
+    doLast {
+        if (!experimentalCore.isFile() || !experimentalCoreDigest.isFile())
+            throw new GradleException('Experimental Android melonDS core/receipt missing; run scripts/build-p4-e3a-melonds-arm64.sh')
+        def expected = experimentalCoreDigest.text.trim().tokenize(' ')[0]
+        def sha = java.security.MessageDigest.getInstance('SHA-256')
+        def digest = { File file ->
+            sha.reset()
+            file.withInputStream { stream ->
+                byte[] bytes = new byte[65536]
+                int n
+                while ((n = stream.read(bytes)) != -1) sha.update(bytes, 0, n)
+            }
+            sha.digest().encodeHex().toString()
+        }
+        if (expected != verifiedE3CoreSha || digest(experimentalCore) != verifiedE3CoreSha)
+            throw new GradleException('Experimental ARM64 core SHA-256 mismatch')
+        if (!experimentalFixture.isFile() ||
+                digest(experimentalFixture) != '1dbbf7e6dea0068a4495b5d3fff5d20f61b099ba48bf9fc0dc0512b136c40588')
+            throw new GradleException('E3 test fixture identity mismatch')
+        if (!experimentalBaseline.isFile() ||
+                experimentalBaseline.length() != 128L * 1024 * 1024 ||
+                !experimentalBaselineDigest.isFile() ||
+                digest(experimentalBaseline) != verifiedE3BaselineSha ||
+                experimentalBaselineDigest.text.trim().tokenize(' ')[0] != verifiedE3BaselineSha)
+            throw new GradleException('E3 FAT16 baseline missing or modified')
+        def nativeDir = file('build/e3test-core/jniLibs/arm64-v8a')
+        def assetsDir = file('build/e3test-core/assets')
+        nativeDir.mkdirs()
+        assetsDir.mkdirs()
+        copy { from experimentalCore; into nativeDir }
+        copy { from file('src/main/jniLibs/arm64-v8a/libmgba_libretro.so'); into nativeDir }
+        copy { from experimentalFixture; into assetsDir; rename { 'e3-dldi-alpha.nds' } }
+        // Android's aapt treats an asset with a .gz suffix specially: it may
+        // decompress it and strip the extension in the APK. Keep the gzip
+        // payload in a neutral, E3-only container name instead.
+        def seed = new File(assetsDir, 'e3-fat16-baseline.e3seed')
+        new File(assetsDir, 'e3-fat16-baseline.gz').delete() // Own obsolete staged artifact only.
+        seed.withOutputStream { output ->
+            def gzip = new java.util.zip.GZIPOutputStream(output, 65536)
+            experimentalBaseline.withInputStream { input -> input.transferTo(gzip) }
+            gzip.finish()
+            gzip.flush()
+        }
+        def stagedCore = new File(nativeDir, 'libmelondsds_libretro.so')
+        if (digest(stagedCore) != expected)
+            throw new GradleException('Experimental packaged native input changed during staging')
+        file('build/e3test-core/core.sha256').text = expected + '\n'
+        file('build/e3test-core/baseline.sha256').text = digest(experimentalBaseline) + '\n'
+    }
+}
+tasks.configureEach {
+    if (name == 'mergeE3testDebugJniLibFolders' ||
+            name == 'mergeE3testReleaseJniLibFolders' ||
+            name == 'mergeE3testDebugAssets' ||
+            name == 'mergeE3testReleaseAssets') {
+        dependsOn tasks.named('verifyAndStageE3TestInputs')
     }
 }
 

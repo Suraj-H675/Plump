@@ -51,7 +51,7 @@ PLUMP_TEST_OVERSIZED_STATE=1 \
 bash "$root/scripts/test-p4-br-ds-reload.sh"
 
 python3 -u "$root/tests/roms/verify-p4-c-checkpoint.py" gba "$core" "$rom" "$work/metrics-gba"
-ds_core="$root/app/build/p3-melonds-host/src/libretro/melondsds_libretro.so"
+ds_core="${PLUMP_P4_LEGACY_DS_CORE:-$root/app/build/p3-melonds-host/src/libretro/melondsds_libretro.so}"
 ds_rom="$root/app/build/p3-native-save-diagnostic/p3_save_diagnostic.nds"
 python3 -u "$root/tests/roms/verify-p4-c-checkpoint.py" ds "$ds_core" "$ds_rom" "$work/metrics-ds"
 

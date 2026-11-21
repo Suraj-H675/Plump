@@ -31,6 +31,17 @@ using SerializeSize = size_t (*)();
 using Serialize = bool (*)(void*, size_t);
 using Unserialize = bool (*)(const void*, size_t);
 using ApiVersion = unsigned (*)();
+#ifdef PLUMP_E3_DLDI_TEST
+// Mirrors the fixed-width, pinned E2 libretro test-export ABI exactly.
+struct DldiStatusV1 {
+    uint32_t version, state, firstError, lastError, lastFatResult;
+    uint64_t imageBytes, sectorsRead, sectorsWritten, readFailures, writeFailures;
+    uint64_t dldiReadCalls, dldiWriteCalls, dldiReadFailures, dldiWriteFailures;
+    uint32_t readOnly, folderSync, dirty, flushAttempted, flushSucceeded;
+    uint32_t closeAttempted, closeSucceeded;
+};
+static_assert(sizeof(DldiStatusV1) == 128, "Pinned E2 DLDI ABI size changed");
+#endif
 
 struct Api {
     void* handle = nullptr;
@@ -52,6 +63,10 @@ struct Api {
     Serialize serialize = nullptr;
     Unserialize unserialize = nullptr;
     ApiVersion apiVersion = nullptr;
+#ifdef PLUMP_E3_DLDI_TEST
+    bool (*dldiStatus)(DldiStatusV1*) = nullptr;
+    bool (*dldiClose)() = nullptr;
+#endif
 };
 
 Api api;
@@ -61,6 +76,9 @@ ANativeWindow* lowerWindow = nullptr;
 std::string systemDir, saveDir;
 std::vector<uint8_t> rom;
 bool loaded = false;
+#ifdef PLUMP_E3_DLDI_TEST
+bool experimentalDldi = false; // Written only while holding coreMutex.
+#endif
 // This pinned melonDS revision retains renderer configuration after unloading
 // its Console. Loading another ROM into that core dereferences the null Console
 // in UpdateRenderer. A load attempt (even a rejected one) requires a fresh
@@ -130,6 +148,15 @@ bool environment(unsigned command, void* data) {
             };
             for (const auto& pair : forced) {
                 if (std::strcmp(option->key, pair.name) == 0) {
+#ifdef PLUMP_E3_DLDI_TEST
+                    // The ordinary production flavor never compiles this.
+                    // E3 test sessions select the isolated working image only.
+                    if (experimentalDldi &&
+                            std::strcmp(pair.name, "melonds_homebrew_sdcard") == 0) {
+                        option->value = "enabled";
+                        return true;
+                    }
+#endif
                     option->value = pair.value;
                     return true;
                 }
@@ -253,10 +280,14 @@ void replaceWindow(JNIEnv* env, jobject surface, ANativeWindow*& target) {
 }
 } // namespace
 
-extern "C" JNIEXPORT jstring JNICALL
-Java_dev_plump_emulator_NativeDs_initialize(JNIEnv* env, jclass, jstring system, jstring save) {
+jstring initializeCore(JNIEnv* env, jstring system, jstring save, bool experimental) {
     std::lock_guard<std::mutex> lock(coreMutex);
     if (api.handle) return problem(env, "DS core is already initialized");
+#ifndef PLUMP_E3_DLDI_TEST
+    if (experimental) return problem(env, "Experimental virtual SD is not compiled in this variant");
+#else
+    experimentalDldi = false;
+#endif
     if (!system || !save) return problem(env, "Private DS storage unavailable");
     const char* sys = env->GetStringUTFChars(system, nullptr);
     if (!sys) return nullptr; // JNI has a pending allocation exception.
@@ -290,11 +321,65 @@ Java_dev_plump_emulator_NativeDs_initialize(JNIEnv* env, jclass, jstring system,
     symbol(api.serialize, "retro_serialize");
     symbol(api.unserialize, "retro_unserialize");
     symbol(api.apiVersion, "retro_api_version");
+#ifdef PLUMP_E3_DLDI_TEST
+    if (experimental &&
+            (!symbol(api.dldiStatus, "melondsds_dldi_status_v1") ||
+             !symbol(api.dldiClose, "melondsds_dldi_close_v1"))) {
+        dlclose(api.handle);
+        api = {};
+        return problem(env, "Experimental melonDS lacks the exact E2 health/close ABI");
+    }
+    experimentalDldi = experimental;
+#endif
     registerCallbacks();
     api.init();
     needsCoreReset = false;
     return nullptr;
 }
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_dev_plump_emulator_NativeDs_initialize(JNIEnv* env, jclass, jstring system, jstring save) {
+    return initializeCore(env, system, save, false);
+}
+
+#ifdef PLUMP_E3_DLDI_TEST
+extern "C" JNIEXPORT jstring JNICALL
+Java_dev_plump_emulator_NativeDs_initializeE3(JNIEnv* env, jclass, jstring system, jstring save) {
+    return initializeCore(env, system, save, true);
+}
+
+extern "C" JNIEXPORT jlongArray JNICALL
+Java_dev_plump_emulator_NativeDs_closeE3Dldi(JNIEnv* env, jclass) {
+    std::lock_guard<std::mutex> lock(coreMutex);
+    if (!experimentalDldi || !loaded || !api.dldiStatus || !api.dldiClose)
+        return nullptr;
+    // The caller MUST have already stopped emulator and audio loops under the
+    // EmulatorSessionOwner transition lock. A new frame cannot run concurrently
+    // with this close because both paths hold coreMutex.
+    DldiStatusV1 before{};
+    if (!api.dldiStatus(&before) || before.version != 1 || before.state != 2 ||
+            before.imageBytes != 128ULL * 1024 * 1024)
+        return nullptr;
+    const bool closeReturned = api.dldiClose();
+    DldiStatusV1 after{};
+    if (!api.dldiStatus(&after)) return nullptr;
+    const jlong result[] = {
+        after.version, after.state, after.firstError, after.lastError,
+        after.lastFatResult, static_cast<jlong>(after.imageBytes),
+        static_cast<jlong>(after.sectorsRead), static_cast<jlong>(after.sectorsWritten),
+        static_cast<jlong>(after.readFailures), static_cast<jlong>(after.writeFailures),
+        static_cast<jlong>(after.dldiReadCalls), static_cast<jlong>(after.dldiWriteCalls),
+        static_cast<jlong>(after.dldiReadFailures), static_cast<jlong>(after.dldiWriteFailures),
+        after.readOnly, after.folderSync, after.dirty, after.flushAttempted,
+        after.flushSucceeded, after.closeAttempted, after.closeSucceeded,
+        closeReturned ? 1LL : 0LL
+    };
+    jlongArray array = env->NewLongArray(static_cast<jsize>(sizeof(result) / sizeof(result[0])));
+    if (array) env->SetLongArrayRegion(array, 0,
+            static_cast<jsize>(sizeof(result) / sizeof(result[0])), result);
+    return array;
+}
+#endif
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_dev_plump_emulator_NativeDs_load(JNIEnv* env, jclass, jbyteArray bytes) {
@@ -546,6 +631,9 @@ Java_dev_plump_emulator_NativeDs_shutdown(JNIEnv*, jclass) {
         api = {};
         needsCoreReset = false;
     }
+#ifdef PLUMP_E3_DLDI_TEST
+    experimentalDldi = false;
+#endif
     std::lock_guard<std::mutex> surfaces(surfaceMutex);
     if (topWindow) { ANativeWindow_release(topWindow); topWindow = nullptr; }
     if (lowerWindow) { ANativeWindow_release(lowerWindow); lowerWindow = nullptr; }

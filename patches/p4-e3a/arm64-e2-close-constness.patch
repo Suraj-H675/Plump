@@ -1,0 +1,13 @@
+--- a/src/libretro/core/test.cpp
++++ b/src/libretro/core/test.cpp
+@@ -163,6 +163,9 @@
+ extern "C" bool melondsds_dldi_close_v1() {
+     using namespace MelonDsDs;
+-    melonDS::NDS* console = Core.GetConsole();
++    // The core owns a mutable NDS object. The getter exposes a const view;
++    // the explicit-close API necessarily mutates its FAT storage. Android
++    // Clang enforces this qualifier unlike the earlier host build.
++    auto* console = const_cast<melonDS::NDS*>(Core.GetConsole());
+     if (!console) return false;
+     auto* cart = dynamic_cast<melonDS::NDSCart::CartSD*>(console->GetNDSCart());
+     return cart && cart->CloseSDCard();
