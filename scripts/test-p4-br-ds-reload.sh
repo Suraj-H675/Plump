@@ -20,6 +20,8 @@ javac --release 17 -d "$probe_classes" \
     "$root/app/src/main/java/dev/plump/emulator/ActiveTimelineStore.java" \
     "$root/app/src/main/java/dev/plump/emulator/NativeSavePromotionStore.java" \
     "$root/app/src/main/java/dev/plump/emulator/SessionReceiptStore.java" \
+    "$root/app/src/main/java/dev/plump/emulator/StorageCapacity.java" \
+    "$root/app/src/main/java/dev/plump/emulator/VirtualSdGenerationStore.java" \
     "$root/app/src/main/java/dev/plump/emulator/EmulatorSessionOwner.java" \
     "$root/app/src/test/java/dev/plump/emulator/HostCheckpointProbe.java"
 export PLUMP_JVM_ERROR_FILE="$work/hs_err_pid%p.log"

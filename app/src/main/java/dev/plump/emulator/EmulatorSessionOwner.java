@@ -12,6 +12,10 @@ final class EmulatorSessionOwner {
     interface Host {
         boolean initializeCore();
         boolean stopAndSave();
+        default StopResult stopAndSaveResult() {
+            boolean stopped = stopAndSave();
+            return StopResult.legacy(stopped);
+        }
         boolean startLoops(long runToken);
         void unloadGame();
         void shutdownCore();
@@ -31,6 +35,29 @@ final class EmulatorSessionOwner {
             return RestoreDisposition.FAILED;
         }
         default void checkpointFailed(String message) { }
+    }
+
+    static final class StopResult {
+        final VirtualSdGenerationStore.Outcome outcome;
+        final boolean quiesced;
+        final boolean terminal;
+
+        StopResult(VirtualSdGenerationStore.Outcome outcome, boolean quiesced, boolean terminal) {
+            this.outcome = outcome;
+            this.quiesced = quiesced;
+            this.terminal = terminal;
+        }
+
+        static StopResult legacy(boolean stopped) {
+            // The legacy boolean only says the host stopped cleanly. It carries
+            // no generation identity or durable publication proof.
+            return new StopResult(null, stopped, false);
+        }
+
+        boolean permitsRetirement() {
+            return quiesced && (outcome == null ||
+                    outcome != VirtualSdGenerationStore.Outcome.RECOVERY_REQUIRED);
+        }
     }
 
     enum RestoreDisposition { RESTORED_PAUSED, CANONICAL_FALLBACK_PAUSED, FAILED }
@@ -136,6 +163,8 @@ final class EmulatorSessionOwner {
         Phase phase;
         long runToken;
         String branchId;
+        StopResult stopResult;
+        boolean gameUnloaded;
 
         Session(Console console, String gameId, Phase phase) {
             this.id = IDS.incrementAndGet();
@@ -149,6 +178,8 @@ final class EmulatorSessionOwner {
         final HostToken token;
         final Host host;
         boolean initialized;
+        boolean initializationAttempted;
+        boolean coreShutdown;
         boolean retired;
         boolean failedLoadCleanup;
         boolean failedShutdown;
@@ -194,9 +225,10 @@ final class EmulatorSessionOwner {
         try {
             HostEntry entry = currentHost(token);
             if (entry == null) return false;
-            if (entry.failedShutdown || entry.failedLoadCleanup) return false;
+            if (entry.failedShutdown || entry.failedLoadCleanup || entry.coreShutdown) return false;
             synchronized (this) { if (entry.initialized) return true; }
             boolean ready;
+            synchronized (this) { entry.initializationAttempted = true; }
             try { ready = entry.host.initializeCore(); }
             catch (RuntimeException failure) { ready = false; }
             if (ready) synchronized (this) { entry.initialized = true; }
@@ -222,6 +254,16 @@ final class EmulatorSessionOwner {
         synchronized (this) {
             HostEntry host = token == null ? null : hosts.get(token.console);
             return host != null && host.token.value == token.value && sessions.containsKey(token.console);
+        }
+    }
+
+    StopResult lastStopResult(HostToken token) {
+        synchronized (this) {
+            if (token == null) return null;
+            HostEntry host = hosts.get(token.console);
+            Session session = sessions.get(token.console);
+            return host != null && host.token.value == token.value && session != null
+                    ? session.stopResult : null;
         }
     }
 
@@ -452,6 +494,7 @@ final class EmulatorSessionOwner {
             synchronized (this) {
                 if (session.phase == Phase.RUNNING) return true;
                 if (session.phase != Phase.PAUSED || exclusiveConsole != null) return false;
+                if (session.stopResult != null && session.stopResult.terminal) return false;
             }
             try { publish(session, SessionReceiptStore.State.RUNNING); }
             catch (IOException failure) { return false; }
@@ -459,6 +502,7 @@ final class EmulatorSessionOwner {
             synchronized (this) {
                 session.runToken = runToken;
                 session.phase = Phase.RUNNING;
+                session.stopResult = null;
                 exclusiveConsole = token.console;
             }
             boolean started;
@@ -484,10 +528,10 @@ final class EmulatorSessionOwner {
                 session.phase = Phase.QUIESCING;
                 exclusiveConsole = token.console;
             }
-            boolean stopped;
-            try { stopped = entry.host.stopAndSave(); }
-            catch (RuntimeException failure) { stopped = false; }
-            if (!stopped) {
+            StopResult stopped = stopSession(entry, session);
+            if (stopped == null || !stopped.permitsRetirement() ||
+                    (stopped.outcome != null &&
+                            stopped.outcome != VirtualSdGenerationStore.Outcome.COMMITTED)) {
                 markRecovery(session, true);
                 return false;
             }
@@ -525,15 +569,20 @@ final class EmulatorSessionOwner {
                         exclusiveConsole = token.console;
                     }
                 }
-                boolean stopped;
-                try { stopped = entry.host.stopAndSave(); }
-                catch (RuntimeException failure) { stopped = false; }
-                if (!stopped) { markRecovery(session, ownsActiveSlot); return false; }
-                if (ownsActiveSlot) maybeCreateAutoCheckpoint(entry, session);
-                try { entry.host.unloadGame(); }
-                catch (RuntimeException failure) { markRecovery(session, ownsActiveSlot); return false; }
+                boolean reusedTerminalStop = session.stopResult != null && session.stopResult.terminal;
+                StopResult stopped = stopSession(entry, session);
+                if (stopped == null || !stopped.permitsRetirement()) {
+                    markRecovery(session, ownsActiveSlot);
+                    return false;
+                }
+                if (ownsActiveSlot && !reusedTerminalStop)
+                    maybeCreateAutoCheckpoint(entry, session);
+                if (!session.gameUnloaded) {
+                    try { entry.host.unloadGame(); session.gameUnloaded = true; }
+                    catch (RuntimeException failure) { markRecovery(session, ownsActiveSlot); return false; }
+                }
             }
-            if (entry.initialized) {
+            if (entry.initializationAttempted && !entry.coreShutdown) {
                 try { entry.host.shutdownCore(); }
                 catch (RuntimeException failure) {
                     synchronized (this) {
@@ -542,6 +591,10 @@ final class EmulatorSessionOwner {
                         if (session != null) session.phase = Phase.RECOVERY_REQUIRED;
                     }
                     return false;
+                }
+                synchronized (this) {
+                    entry.coreShutdown = true;
+                    entry.initialized = false;
                 }
             }
             if (session != null) {
@@ -701,10 +754,13 @@ final class EmulatorSessionOwner {
             session.phase = Phase.QUIESCING;
             exclusiveConsole = session.console;
         }
-        boolean stopped;
-        try { stopped = entry.host.stopAndSave(); }
-        catch (RuntimeException failure) { stopped = false; }
-        if (!stopped) { markRecovery(session, true); return false; }
+        StopResult stopped = stopSession(entry, session);
+        if (stopped == null || !stopped.permitsRetirement() ||
+                (stopped.outcome != null &&
+                        stopped.outcome != VirtualSdGenerationStore.Outcome.COMMITTED)) {
+            markRecovery(session, true);
+            return false;
+        }
         try { publish(session, SessionReceiptStore.State.PAUSED); }
         catch (IOException failure) { markRecovery(session, true); return false; }
         synchronized (this) {
@@ -713,6 +769,21 @@ final class EmulatorSessionOwner {
         maybeCreateAutoCheckpoint(entry, session);
         synchronized (this) { if (exclusiveConsole == session.console) exclusiveConsole = null; }
         return true;
+    }
+
+    private StopResult stopSession(HostEntry entry, Session session) {
+        synchronized (this) {
+            if (session.stopResult != null && session.stopResult.terminal) return session.stopResult;
+        }
+        StopResult result;
+        try { result = entry.host.stopAndSaveResult(); }
+        catch (RuntimeException failure) {
+            result = StopResult.legacy(false);
+        }
+        if (result == null)
+            result = new StopResult(VirtualSdGenerationStore.Outcome.RECOVERY_REQUIRED, false, true);
+        synchronized (this) { session.stopResult = result; }
+        return result;
     }
 
     private void maybeCreateAutoCheckpoint(HostEntry entry, Session session) {

@@ -12,6 +12,8 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.Arrays;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.Assert.*;
 
@@ -47,6 +49,37 @@ public final class VirtualSdGenerationStoreTest {
         assertEquals(second.id, store.current().id);
         assertTrue(Files.isRegularFile(root.resolve("canonical/HEAD.0")));
         assertTrue(Files.isRegularFile(root.resolve("canonical/HEAD.1")));
+    }
+
+    @Test public void threeNormalWritesAdvanceBaselineThroughExactParentChain() throws Exception {
+        Path root = temporary.newFolder().toPath();
+        VirtualSdGenerationStore store = store(root.resolve("canonical"), "canonical", ignored -> { });
+        VirtualSdGenerationStore.Generation current = store.initialize(createImage(root.resolve("base.img"), 12));
+        assertEquals(1, current.sequence);
+
+        for (int write = 0; write < 3; write++) {
+            String priorSha = sha(current.imageFile);
+            VirtualSdGenerationStore.WorkingSession session = store.openSession();
+            writeAt(session.imageFile, 32768L * (write + 1), (byte) (90 + write));
+            String candidateId = UUID.randomUUID().toString();
+            VirtualSdGenerationStore.TransactionResult result = store.commitTransaction(session,
+                    goodReceipt(), "none", candidateId, VirtualSdGenerationStore.NO_CANCELLATION);
+
+            assertEquals(VirtualSdGenerationStore.Outcome.COMMITTED, result.outcome);
+            assertTrue(result.cleanupResolved);
+            assertEquals(candidateId, result.identity.candidateGenerationId);
+            assertEquals(current.sequence, result.identity.expectedHeadSequence);
+            assertEquals(current.id, result.identity.expectedHeadGenerationId);
+            assertEquals(current.id, result.generation.parentGenerationId);
+            assertEquals(current.sequence + 1, result.generation.sequence);
+            assertEquals(priorSha, sha(current.imageFile));
+
+            current = store.currentForWrite();
+            assertEquals(candidateId, current.id);
+        }
+
+        assertEquals("baseline plus three verified writes advances 1 → 2 → 3 → 4",
+                4, current.sequence);
     }
 
     @Test public void readOnlyBaselineProducesWritableWorkingCopy() throws Exception {
@@ -100,25 +133,27 @@ public final class VirtualSdGenerationStoreTest {
             if (point == failAt[0]) throw new IOException("injected after generation rename");
         });
         VirtualSdGenerationStore.Generation first = firstStore.initialize(createImage(root.resolve("base.img"), 31));
+        String priorSha = sha(first.imageFile);
         VirtualSdGenerationStore.WorkingSession session = firstStore.openSession();
         writeAt(session.imageFile, 16384, (byte) 123);
         failAt[0] = VirtualSdGenerationStore.FaultPoint.AFTER_GENERATION_RENAME;
-        try {
-            firstStore.commit(session, goodReceipt());
-            fail("injected publication interruption should fail the operation");
-        } catch (IOException expected) {
-            assertTrue(expected.getMessage().contains("injected"));
-        }
+        String candidateId = UUID.randomUUID().toString();
+        VirtualSdGenerationStore.TransactionResult tx = firstStore.commitTransaction(
+                session, goodReceipt(), "none", candidateId, VirtualSdGenerationStore.NO_CANCELLATION);
+        assertEquals(VirtualSdGenerationStore.Outcome.NOT_COMMITTED, tx.outcome);
+        assertTrue(tx.cleanupResolved);
         assertEquals("the old head remains authoritative until pointer publication", first.id,
                 firstStore.current().id);
-        assertEquals("the unreferenced generation remains evidence, not an automatic recovery choice", 2,
+        assertEquals("the exact unpublished candidate is quarantined, never promoted", 1,
                 countChildren(storeRoot.resolve("generations")));
+        assertEquals(1, countChildren(storeRoot.resolve("quarantine")));
+        assertEquals(priorSha, sha(firstStore.current().imageFile));
         VirtualSdGenerationStore.WorkingSession retry = firstStore.openSession();
         assertEquals(first.imageSha256, sha(retry.imageFile));
         firstStore.abort(retry);
     }
 
-    @Test public void interruptionAfterHeadRenameLeavesOnlyValidOldOrNewGeneration() throws Exception {
+    @Test public void uncertainHeadRenameRetainsExactIdentityUntilStrictReconciliation() throws Exception {
         Path root = temporary.newFolder().toPath();
         Path storeRoot = root.resolve("canonical");
         VirtualSdGenerationStore.FaultPoint[] failAt = {null};
@@ -126,19 +161,37 @@ public final class VirtualSdGenerationStoreTest {
             if (point == failAt[0]) throw new IOException("injected after head rename");
         });
         VirtualSdGenerationStore.Generation first = store.initialize(createImage(root.resolve("base.img"), 41));
+        String priorSha = sha(first.imageFile);
         VirtualSdGenerationStore.WorkingSession session = store.openSession();
         writeAt(session.imageFile, 32768, (byte) 101);
         failAt[0] = VirtualSdGenerationStore.FaultPoint.AFTER_HEAD_RENAME;
-        try {
-            store.commit(session, goodReceipt());
-            fail("directory-sync fault should not be reported as a successful commit");
-        } catch (IOException expected) {
-            assertTrue(expected.getMessage().contains("injected"));
-        }
-        VirtualSdGenerationStore.Generation recovered = store.current();
-        assertTrue(recovered.sequence == first.sequence || recovered.sequence == first.sequence + 1);
-        assertTrue("recovery may select only a fully verified generation",
-                recovered.id.equals(first.id) || Files.isRegularFile(recovered.imageFile));
+        String candidateId = UUID.randomUUID().toString();
+        VirtualSdGenerationStore.TransactionResult uncertain = store.commitTransaction(
+                session, goodReceipt(), "none", candidateId, VirtualSdGenerationStore.NO_CANCELLATION);
+        assertEquals(VirtualSdGenerationStore.Outcome.RECOVERY_REQUIRED, uncertain.outcome);
+        assertFalse(uncertain.cleanupResolved);
+        assertTrue(uncertain.headRenameAttempted);
+        assertFalse(uncertain.directorySyncConfirmed);
+        assertEquals(candidateId, uncertain.identity.candidateGenerationId);
+        assertEquals(first.sequence, uncertain.identity.expectedHeadSequence);
+        assertEquals(first.id, uncertain.identity.expectedHeadGenerationId);
+        assertEquals(first.headSha256, uncertain.identity.expectedHeadSha256);
+        assertEquals(2, uncertain.identity.candidateSequence);
+        assertTrue(Files.exists(storeRoot.resolve("PENDING_TRANSACTION.vsd")));
+        assertTrue("ordinary head reading cannot hide an indeterminate rename",
+                assertThrows(IOException.class, store::current).getMessage().contains("recovery"));
+        assertThrows(IOException.class, store::currentForWrite);
+
+        VirtualSdGenerationStore.TransactionResult reconciled = store.reconcileStrict(uncertain.identity);
+        assertEquals(VirtualSdGenerationStore.Outcome.COMMITTED, reconciled.outcome);
+        assertTrue(reconciled.cleanupResolved);
+        assertNotNull(reconciled.generation);
+        assertEquals(candidateId, reconciled.generation.id);
+        assertEquals(first.id, reconciled.generation.parentGenerationId);
+        assertEquals(2, reconciled.generation.sequence);
+        assertFalse(Files.exists(storeRoot.resolve("PENDING_TRANSACTION.vsd")));
+        assertEquals(priorSha, sha(first.imageFile));
+        assertEquals(candidateId, store.currentForWrite().id);
     }
 
     @Test public void fsyncedTemporaryHeadIsNotPromotedBeforeAtomicRename() throws Exception {
@@ -160,7 +213,272 @@ public final class VirtualSdGenerationStoreTest {
         }
         assertEquals(first.id, store.current().id);
         assertFalse(Files.exists(root.resolve("canonical/HEAD.0")));
+        assertTrue(countChildren(root.resolve("canonical/quarantine")) >= 2);
+        assertFalse(Files.exists(root.resolve("canonical/PENDING_TRANSACTION.vsd")));
+    }
+
+    @Test public void directorySyncBoundaryDeterminesTheReportedCommitOutcome() throws Exception {
+        Path root = temporary.newFolder().toPath();
+        VirtualSdGenerationStore.FaultPoint[] failAt = {null};
+        VirtualSdGenerationStore store = store(root.resolve("canonical"), "canonical", point -> {
+            if (point == failAt[0]) {
+                failAt[0] = null;
+                throw new IOException("injected " + point);
+            }
+        });
+        VirtualSdGenerationStore.Generation first = store.initialize(createImage(root.resolve("base.img"), 47));
+
+        VirtualSdGenerationStore.WorkingSession beforeSync = store.openSession();
+        failAt[0] = VirtualSdGenerationStore.FaultPoint.DURING_HEAD_DIRECTORY_SYNC;
+        VirtualSdGenerationStore.TransactionResult uncertain = store.commitTransaction(beforeSync,
+                goodReceipt(), "none", UUID.randomUUID().toString(), VirtualSdGenerationStore.NO_CANCELLATION);
+        assertEquals(VirtualSdGenerationStore.Outcome.RECOVERY_REQUIRED, uncertain.outcome);
+        assertFalse(uncertain.directorySyncConfirmed);
+        assertEquals(VirtualSdGenerationStore.Outcome.COMMITTED,
+                store.reconcileStrict(uncertain.identity).outcome);
+
+        VirtualSdGenerationStore.Generation beforeAfterSync = store.current();
+        VirtualSdGenerationStore.WorkingSession afterSync = store.openSession();
+        failAt[0] = VirtualSdGenerationStore.FaultPoint.AFTER_HEAD_DIRECTORY_SYNC;
+        VirtualSdGenerationStore.TransactionResult committed = store.commitTransaction(afterSync,
+                goodReceipt(), "none", UUID.randomUUID().toString(), VirtualSdGenerationStore.NO_CANCELLATION);
+        assertEquals(VirtualSdGenerationStore.Outcome.COMMITTED, committed.outcome);
+        assertTrue(committed.directorySyncConfirmed);
+        assertTrue(committed.cleanupResolved);
+        assertEquals(beforeAfterSync.id, store.current().parentGenerationId);
+    }
+
+    @Test public void corruptCandidateAfterHeadRenameRemainsIndeterminateWithoutFallback() throws Exception {
+        Path root = temporary.newFolder().toPath();
+        VirtualSdGenerationStore.FaultPoint[] failAt = {null};
+        VirtualSdGenerationStore store = store(root.resolve("canonical"), "canonical", point -> {
+            if (point == failAt[0]) throw new IOException("injected after HEAD rename");
+        });
+        VirtualSdGenerationStore.Generation first = store.initialize(createImage(root.resolve("base.img"), 54));
+        String oldSha = sha(first.imageFile);
+        VirtualSdGenerationStore.WorkingSession session = store.openSession();
+        writeAt(session.imageFile, 49152, (byte) 76);
+        failAt[0] = VirtualSdGenerationStore.FaultPoint.AFTER_HEAD_RENAME;
+        VirtualSdGenerationStore.TransactionResult uncertain = store.commitTransaction(session,
+                goodReceipt(), "none", UUID.randomUUID().toString(), VirtualSdGenerationStore.NO_CANCELLATION);
+        assertEquals(VirtualSdGenerationStore.Outcome.RECOVERY_REQUIRED, uncertain.outcome);
+        writeAt(uncertain.generation == null
+                ? root.resolve("canonical/generations/gen-" + uncertain.identity.candidateGenerationId)
+                        .resolve(VirtualSdGenerationStore.IMAGE_RELATIVE)
+                : uncertain.generation.imageFile, 49152, (byte) 77);
+
+        VirtualSdGenerationStore.TransactionResult reconciled = store.reconcileStrict(uncertain.identity);
+        assertEquals(VirtualSdGenerationStore.Outcome.RECOVERY_REQUIRED, reconciled.outcome);
+        assertFalse(reconciled.cleanupResolved);
+        assertTrue(Files.exists(root.resolve("canonical/PENDING_TRANSACTION.vsd")));
+        assertEquals(oldSha, sha(first.imageFile));
+        assertThrows(IOException.class, store::current);
+        assertThrows(IOException.class, store::currentForWrite);
+    }
+
+    @Test public void faultsBeforeGenerationAndHeadRenameProveTheOldHeadAndQuarantineCandidate() throws Exception {
+        Path root = temporary.newFolder().toPath();
+        AtomicReference<VirtualSdGenerationStore.FaultPoint> failAt = new AtomicReference<>();
+        VirtualSdGenerationStore store = store(root.resolve("canonical"), "canonical", point -> {
+            if (failAt.compareAndSet(point, null)) throw new IOException("injected " + point);
+        });
+        VirtualSdGenerationStore.Generation first = store.initialize(createImage(root.resolve("base.img"), 50));
+        String originalSha = sha(first.imageFile);
+
+        VirtualSdGenerationStore.WorkingSession beforeGeneration = store.openSession();
+        writeAt(beforeGeneration.imageFile, 49152, (byte) 73);
+        failAt.set(VirtualSdGenerationStore.FaultPoint.BEFORE_GENERATION_RENAME);
+        VirtualSdGenerationStore.TransactionResult generationResult = store.commitTransaction(beforeGeneration,
+                goodReceipt(), "none", UUID.randomUUID().toString(), VirtualSdGenerationStore.NO_CANCELLATION);
+        assertEquals(VirtualSdGenerationStore.Outcome.NOT_COMMITTED, generationResult.outcome);
+        assertTrue(generationResult.cleanupResolved);
+        assertFalse(generationResult.headRenameAttempted);
+        assertEquals(originalSha, sha(store.current().imageFile));
+
+        VirtualSdGenerationStore.WorkingSession beforeHead = store.openSession();
+        writeAt(beforeHead.imageFile, 65536, (byte) 74);
+        failAt.set(VirtualSdGenerationStore.FaultPoint.BEFORE_HEAD_RENAME);
+        VirtualSdGenerationStore.TransactionResult headResult = store.commitTransaction(beforeHead,
+                goodReceipt(), "none", UUID.randomUUID().toString(), VirtualSdGenerationStore.NO_CANCELLATION);
+        assertEquals(VirtualSdGenerationStore.Outcome.NOT_COMMITTED, headResult.outcome);
+        assertTrue(headResult.cleanupResolved);
+        assertFalse(headResult.headRenameAttempted);
+        assertEquals(originalSha, sha(store.current().imageFile));
+        assertEquals(1, countChildren(root.resolve("canonical/generations")));
+        assertFalse(Files.exists(root.resolve("canonical/PENDING_TRANSACTION.vsd")));
+    }
+
+    @Test public void cancellationBeforeBootstrapCopyLeavesNoAuthorityOrPendingMarker() throws Exception {
+        Path root = temporary.newFolder().toPath();
+        AtomicReference<VirtualSdGenerationStore.FaultPoint> cancelAt = new AtomicReference<>(
+                VirtualSdGenerationStore.FaultPoint.BEFORE_BOOTSTRAP_IMAGE_COPY);
+        AtomicReference<Boolean> cancelled = new AtomicReference<>(false);
+        VirtualSdGenerationStore store = new VirtualSdGenerationStore(root.resolve("canonical"), IDENTITY,
+                "canonical", IMAGE_BYTES, VirtualSdGenerationStoreTest::syncDirectory,
+                VirtualSdGenerationStoreTest::validateImage, point -> {
+                    if (cancelAt.compareAndSet(point, null)) cancelled.set(true);
+                });
+        VirtualSdGenerationStore.TransactionControl control = transactionControl(cancelled);
+        VirtualSdGenerationStore.TransactionResult result = store.initializeTransaction(
+                createImage(root.resolve("base.img"), 48), "none", "none", UUID.randomUUID().toString(), control);
+        assertEquals(VirtualSdGenerationStore.Outcome.NOT_COMMITTED, result.outcome);
+        assertTrue(result.cleanupResolved);
+        assertNull(store.currentForWrite());
+        assertFalse(Files.exists(root.resolve("canonical/PENDING_TRANSACTION.vsd")));
+        assertEquals(0, countChildren(root.resolve("canonical/generations")));
+    }
+
+    @Test public void cancellationDuringWorkingCopyQuarantinesPartialImageAndKeepsBaseline() throws Exception {
+        Path root = temporary.newFolder().toPath();
+        AtomicReference<VirtualSdGenerationStore.FaultPoint> cancelAt = new AtomicReference<>();
+        AtomicReference<Boolean> cancelled = new AtomicReference<>(false);
+        VirtualSdGenerationStore store = new VirtualSdGenerationStore(root.resolve("canonical"), IDENTITY,
+                "canonical", IMAGE_BYTES, VirtualSdGenerationStoreTest::syncDirectory,
+                VirtualSdGenerationStoreTest::validateImage,
+                point -> { if (cancelAt.compareAndSet(point, null)) cancelled.set(true); });
+        VirtualSdGenerationStore.Generation first = store.initialize(createImage(root.resolve("base.img"), 52));
+        String priorSha = sha(first.imageFile);
+        cancelAt.set(VirtualSdGenerationStore.FaultPoint.BEFORE_WORKING_IMAGE_COPY);
+        try {
+            store.openSession(transactionControl(cancelled));
+            fail("canceled working copy must not escape as a live session");
+        } catch (IOException expected) {
+            assertTrue(expected.getMessage().contains("cancellation"));
+        }
+        assertEquals(first.id, store.currentForWrite().id);
+        assertEquals(priorSha, sha(store.currentForWrite().imageFile));
+        assertEquals(0, countChildren(root.resolve("canonical/working")));
         assertEquals(1, countChildren(root.resolve("canonical/quarantine")));
+    }
+
+    @Test public void cancellationDuringCommitValidationDoesNotPublishOrReleaseOldAuthority() throws Exception {
+        Path root = temporary.newFolder().toPath();
+        AtomicReference<VirtualSdGenerationStore.FaultPoint> cancelAt = new AtomicReference<>();
+        AtomicReference<Boolean> cancelled = new AtomicReference<>(false);
+        VirtualSdGenerationStore store = new VirtualSdGenerationStore(root.resolve("canonical"), IDENTITY,
+                "canonical", IMAGE_BYTES, VirtualSdGenerationStoreTest::syncDirectory,
+                VirtualSdGenerationStoreTest::validateImage,
+                point -> { if (cancelAt.compareAndSet(point, null)) cancelled.set(true); });
+        VirtualSdGenerationStore.Generation first = store.initialize(createImage(root.resolve("base.img"), 53));
+        String priorSha = sha(first.imageFile);
+        VirtualSdGenerationStore.WorkingSession session = store.openSession();
+        writeAt(session.imageFile, 65536, (byte) 75);
+        cancelAt.set(VirtualSdGenerationStore.FaultPoint.BEFORE_COMMIT_IMAGE_FORCE);
+        VirtualSdGenerationStore.TransactionResult result = store.commitTransaction(session,
+                goodReceipt(), "none", UUID.randomUUID().toString(), transactionControl(cancelled));
+        assertEquals(VirtualSdGenerationStore.Outcome.NOT_COMMITTED, result.outcome);
+        assertTrue(result.cleanupResolved);
+        assertFalse(result.headRenameAttempted);
+        assertEquals(first.id, store.currentForWrite().id);
+        assertEquals(priorSha, sha(store.currentForWrite().imageFile));
+        assertFalse(Files.exists(root.resolve("canonical/PENDING_TRANSACTION.vsd")));
+    }
+
+    @Test public void cancellationAfterHeadStagingButBeforeAuthorizationLeavesOldHead() throws Exception {
+        Path root = temporary.newFolder().toPath();
+        AtomicReference<Boolean> cancelled = new AtomicReference<>(false);
+        AtomicReference<Boolean> armed = new AtomicReference<>(false);
+        VirtualSdGenerationStore store = new VirtualSdGenerationStore(root.resolve("canonical"), IDENTITY,
+                "canonical", IMAGE_BYTES, VirtualSdGenerationStoreTest::syncDirectory,
+                VirtualSdGenerationStoreTest::validateImage,
+                point -> { if (armed.get() && point == VirtualSdGenerationStore.FaultPoint.AFTER_HEAD_FILE_FORCE)
+                    cancelled.set(true); });
+        VirtualSdGenerationStore.Generation first = store.initialize(createImage(root.resolve("base.img"), 55));
+        String priorSha = sha(first.imageFile);
+        VirtualSdGenerationStore.WorkingSession session = store.openSession();
+        writeAt(session.imageFile, 98304, (byte) 78);
+        armed.set(true);
+        VirtualSdGenerationStore.TransactionResult result = store.commitTransaction(session,
+                goodReceipt(), "none", UUID.randomUUID().toString(), transactionControl(cancelled));
+        assertEquals(VirtualSdGenerationStore.Outcome.NOT_COMMITTED, result.outcome);
+        assertTrue(result.cleanupResolved);
+        assertFalse(result.headRenameAttempted);
+        assertEquals(first.id, store.currentForWrite().id);
+        assertEquals(priorSha, sha(store.currentForWrite().imageFile));
+        assertFalse(Files.exists(root.resolve("canonical/PENDING_TRANSACTION.vsd")));
+    }
+
+    @Test public void cancellationAfterAuthorizationDoesNotReverseVerifiedCommit() throws Exception {
+        Path root = temporary.newFolder().toPath();
+        AtomicReference<Boolean> cancelled = new AtomicReference<>(false);
+        AtomicReference<Boolean> armed = new AtomicReference<>(false);
+        VirtualSdGenerationStore store = new VirtualSdGenerationStore(root.resolve("canonical"), IDENTITY,
+                "canonical", IMAGE_BYTES, VirtualSdGenerationStoreTest::syncDirectory,
+                VirtualSdGenerationStoreTest::validateImage,
+                point -> { if (armed.get() && point == VirtualSdGenerationStore.FaultPoint.AFTER_HEAD_RENAME)
+                    cancelled.set(true); });
+        VirtualSdGenerationStore.Generation first = store.initialize(createImage(root.resolve("base.img"), 56));
+        VirtualSdGenerationStore.WorkingSession session = store.openSession();
+        writeAt(session.imageFile, 114688, (byte) 79);
+        armed.set(true);
+        VirtualSdGenerationStore.TransactionResult result = store.commitTransaction(session,
+                goodReceipt(), "none", UUID.randomUUID().toString(), transactionControl(cancelled));
+        assertEquals(VirtualSdGenerationStore.Outcome.COMMITTED, result.outcome);
+        assertTrue(result.cleanupResolved);
+        assertTrue(result.headRenameAttempted);
+        assertTrue(result.directorySyncConfirmed);
+        assertEquals(first.id, result.generation.parentGenerationId);
+        assertEquals(result.generation.id, store.currentForWrite().id);
+    }
+
+    @Test public void coldProcessReconcilesPersistedExactCandidateAndParent() throws Exception {
+        Path root = temporary.newFolder().toPath();
+        Path storeRoot = root.resolve("canonical");
+        VirtualSdGenerationStore firstStore = store(storeRoot, "canonical", ignored -> { });
+        VirtualSdGenerationStore.Generation first = firstStore.initialize(createImage(root.resolve("base.img"), 49));
+        String firstSha = sha(first.imageFile);
+        String candidateId = UUID.randomUUID().toString();
+        Process child = new ProcessBuilder(javaExecutable(), "-cp", System.getProperty("java.class.path"),
+                VirtualSdGenerationStoreCrashProbe.class.getName(), storeRoot.toString(), candidateId)
+                .redirectErrorStream(true).start();
+        byte[] output;
+        try {
+            if (!child.waitFor(20, TimeUnit.SECONDS)) {
+                child.destroyForcibly();
+                fail("crash probe did not reach its cold-recovery boundary");
+            }
+            output = child.getInputStream().readAllBytes();
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            child.destroyForcibly();
+            throw new IOException("Interrupted during cold-recovery probe", interrupted);
+        }
+        assertEquals(new String(output, java.nio.charset.StandardCharsets.UTF_8), 0, child.exitValue());
+        assertTrue(Files.exists(storeRoot.resolve("PENDING_TRANSACTION.vsd")));
+
+        VirtualSdGenerationStore coldStore = store(storeRoot, "canonical", ignored -> { });
+        VirtualSdGenerationStore.TransactionResult recovered = coldStore.reconcilePendingStrict();
+        assertEquals(VirtualSdGenerationStore.Outcome.COMMITTED, recovered.outcome);
+        assertTrue(recovered.cleanupResolved);
+        assertEquals(candidateId, recovered.identity.candidateGenerationId);
+        assertEquals(first.id, recovered.identity.expectedHeadGenerationId);
+        assertEquals(first.id, recovered.generation.parentGenerationId);
+        assertEquals(2, recovered.generation.sequence);
+        assertEquals(firstSha, sha(first.imageFile));
+        assertEquals(candidateId, coldStore.currentForWrite().id);
+        assertFalse(Files.exists(storeRoot.resolve("PENDING_TRANSACTION.vsd")));
+    }
+
+    @Test public void freshReconcileWithoutPendingMarkerDoesNotClaimNotCommitted() throws Exception {
+        Path root = temporary.newFolder().toPath();
+        Path storeRoot = root.resolve("canonical");
+        VirtualSdGenerationStore writer = store(storeRoot, "canonical", ignored -> { });
+        VirtualSdGenerationStore.Generation first = writer.initialize(createImage(root.resolve("base.img"), 50));
+        VirtualSdGenerationStore.WorkingSession session = writer.openSession();
+        writeAt(session.imageFile, 65536, (byte) 87);
+        VirtualSdGenerationStore.Generation committed = writer.commit(session, goodReceipt());
+        assertEquals(2, committed.sequence);
+        assertFalse(Files.exists(storeRoot.resolve("PENDING_TRANSACTION.vsd")));
+
+        VirtualSdGenerationStore freshProcessView = store(storeRoot, "canonical", ignored -> { });
+        VirtualSdGenerationStore.TransactionResult result = freshProcessView.reconcilePendingStrict();
+        assertEquals("absence of a marker is not proof that a transaction did not publish",
+                VirtualSdGenerationStore.Outcome.NO_PENDING, result.outcome);
+        assertNull(result.identity);
+        assertNull(result.generation);
+        assertTrue(result.cleanupResolved);
+        assertEquals(first.id, committed.parentGenerationId);
+        assertEquals(committed.id, freshProcessView.currentForWrite().id);
     }
 
     @Test public void corruptNewestGenerationFallsBackToPreviousVerifiedHead() throws Exception {
@@ -174,6 +492,12 @@ public final class VirtualSdGenerationStoreTest {
         writeAt(second.imageFile, 65536, (byte) 89);
         assertEquals("a hash-invalid newest generation must fall back to its valid predecessor",
                 first.id, store.current().id);
+        byte[] corruptedHead = Files.readAllBytes(root.resolve("canonical/HEAD.0"));
+        assertThrows("writer reads must not use ordinary fallback", IOException.class,
+                store::currentForWrite);
+        assertArrayEquals("strict rejection must not rewrite either authority slot", corruptedHead,
+                Files.readAllBytes(root.resolve("canonical/HEAD.0")));
+        assertEquals(first.id, store.current().id);
     }
 
     @Test public void branchStorageCannotAdvanceCanonicalStorage() throws Exception {
@@ -328,6 +652,20 @@ public final class VirtualSdGenerationStoreTest {
                 0, 0, 0, 0, false, false, true, true, true, true, true, true);
     }
 
+    private static VirtualSdGenerationStore.TransactionControl transactionControl(
+            AtomicReference<Boolean> cancelled) {
+        return new VirtualSdGenerationStore.TransactionControl() {
+            @Override public void checkCancellation() throws IOException {
+                if (cancelled.get()) throw new IOException("test cancellation");
+            }
+            @Override public boolean authorizePublication(String candidateGenerationId) {
+                return !cancelled.get();
+            }
+            @Override public void publicationResolved(String candidateGenerationId,
+                                                      VirtualSdGenerationStore.Outcome outcome) { }
+        };
+    }
+
     private static Path createImage(Path path, int seed) throws IOException {
         byte[] bytes = new byte[(int) IMAGE_BYTES];
         byte[] marker = "PLUMPFAT".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
@@ -414,5 +752,9 @@ public final class VirtualSdGenerationStoreTest {
         char[] result = new char[count];
         Arrays.fill(result, value);
         return new String(result);
+    }
+
+    private static String javaExecutable() {
+        return java.nio.file.Paths.get(System.getProperty("java.home"), "bin", "java").toString();
     }
 }

@@ -43,6 +43,10 @@ public final class EmulatorSessionOwnerTest {
         assertTrue(owner.isCurrentRun(token, firstRun));
         assertTrue(owner.pause(token));
         assertTrue(owner.pause(token));
+        EmulatorSessionOwner.StopResult legacyStop = owner.lastStopResult(token);
+        assertNotNull(legacyStop);
+        assertTrue(legacyStop.quiesced);
+        assertNull("legacy stop booleans do not prove a durable generation commit", legacyStop.outcome);
         assertEquals(1, host.stops.get());
         assertTrue(owner.resume(token));
         assertEquals(2, host.starts.get());
@@ -275,6 +279,120 @@ public final class EmulatorSessionOwnerTest {
         assertEquals(0, host.unloads.get());
         assertTrue(owner.pause(token));
         assertFalse(owner.isCurrentRun(token, host.lastRunToken));
+    }
+
+    @Test public void committedStopOutcomeSurvivesPausedAndClosedReceiptFailures() throws Exception {
+        Path root = temporary.newFolder().toPath();
+        AtomicReference<SessionReceiptStore.Failpoint> failAtPoint = new AtomicReference<>();
+        SessionReceiptStore receipts = new SessionReceiptStore(root, point -> {
+            if (failAtPoint.compareAndSet(point, null))
+                throw new IOException("injected receipt failure at " + point);
+        });
+        EmulatorSessionOwner owner = new EmulatorSessionOwner();
+        AtomicInteger stopCalls = new AtomicInteger();
+        AtomicInteger unloadCalls = new AtomicInteger();
+        AtomicInteger shutdownCalls = new AtomicInteger();
+        EmulatorSessionOwner.Host host = new EmulatorSessionOwner.Host() {
+            @Override public boolean initializeCore() { return true; }
+            @Override public boolean stopAndSave() { stopCalls.incrementAndGet(); return true; }
+            @Override public EmulatorSessionOwner.StopResult stopAndSaveResult() {
+                stopCalls.incrementAndGet();
+                return new EmulatorSessionOwner.StopResult(
+                        VirtualSdGenerationStore.Outcome.COMMITTED, true, true);
+            }
+            @Override public boolean startLoops(long runToken) { return true; }
+            @Override public void unloadGame() { unloadCalls.incrementAndGet(); }
+            @Override public void shutdownCore() { shutdownCalls.incrementAndGet(); }
+        };
+        EmulatorSessionOwner.HostToken token = owner.attach(EmulatorSessionOwner.Console.DS, host, receipts);
+        assertTrue(owner.initialize(token));
+        assertTrue(open(owner, token, GAME_A).opened);
+        assertTrue(owner.resume(token));
+
+        failAtPoint.set(SessionReceiptStore.Failpoint.BEFORE_RENAME);
+        assertFalse("PAUSED receipt failure must remain separate from the durable store commit",
+                owner.pause(token));
+        assertEquals(VirtualSdGenerationStore.Outcome.COMMITTED, owner.lastStopResult(token).outcome);
+        assertTrue(owner.closeHost(token));
+        assertEquals(1, stopCalls.get());
+        assertEquals(1, unloadCalls.get());
+        assertEquals(1, shutdownCalls.get());
+
+        Path secondRoot = temporary.newFolder().toPath();
+        AtomicReference<SessionReceiptStore.Failpoint> secondFailAtPoint = new AtomicReference<>();
+        SessionReceiptStore secondReceipts = new SessionReceiptStore(secondRoot, point -> {
+            if (secondFailAtPoint.compareAndSet(point, null))
+                throw new IOException("injected receipt failure at " + point);
+        });
+        EmulatorSessionOwner secondOwner = new EmulatorSessionOwner();
+        AtomicInteger secondStopCalls = new AtomicInteger();
+        AtomicInteger secondUnloadCalls = new AtomicInteger();
+        AtomicInteger secondShutdownCalls = new AtomicInteger();
+        EmulatorSessionOwner.Host secondHost = new EmulatorSessionOwner.Host() {
+            @Override public boolean initializeCore() { return true; }
+            @Override public boolean stopAndSave() { secondStopCalls.incrementAndGet(); return true; }
+            @Override public EmulatorSessionOwner.StopResult stopAndSaveResult() {
+                secondStopCalls.incrementAndGet();
+                return new EmulatorSessionOwner.StopResult(
+                        VirtualSdGenerationStore.Outcome.COMMITTED, true, true);
+            }
+            @Override public boolean startLoops(long runToken) { return true; }
+            @Override public void unloadGame() { secondUnloadCalls.incrementAndGet(); }
+            @Override public void shutdownCore() { secondShutdownCalls.incrementAndGet(); }
+        };
+        EmulatorSessionOwner.HostToken secondToken = secondOwner.attach(
+                EmulatorSessionOwner.Console.DS, secondHost, secondReceipts);
+        assertTrue(secondOwner.initialize(secondToken));
+        assertTrue(open(secondOwner, secondToken, GAME_A).opened);
+        assertTrue(secondOwner.resume(secondToken));
+        assertTrue(secondOwner.pause(secondToken));
+        secondFailAtPoint.set(SessionReceiptStore.Failpoint.AFTER_RENAME);
+        assertFalse("CLOSED receipt failure must not erase the already committed store outcome",
+                secondOwner.closeHost(secondToken));
+        assertEquals(VirtualSdGenerationStore.Outcome.COMMITTED,
+                secondOwner.lastStopResult(secondToken).outcome);
+        assertEquals(1, secondStopCalls.get());
+        assertEquals(1, secondUnloadCalls.get());
+        assertEquals(1, secondShutdownCalls.get());
+        assertTrue(secondOwner.closeHost(secondToken));
+        assertEquals("closeHost may retry its receipt but never calls the terminal store callback again",
+                1, secondStopCalls.get());
+        assertEquals(1, secondUnloadCalls.get());
+        assertEquals(1, secondShutdownCalls.get());
+    }
+
+    @Test public void committedButUnquiescedStopKeepsTheOwnerAndWorkingImageBlocked() throws Exception {
+        Path root = temporary.newFolder().toPath();
+        EmulatorSessionOwner owner = new EmulatorSessionOwner();
+        AtomicInteger stopCalls = new AtomicInteger();
+        AtomicInteger unloadCalls = new AtomicInteger();
+        AtomicInteger shutdownCalls = new AtomicInteger();
+        EmulatorSessionOwner.Host host = new EmulatorSessionOwner.Host() {
+            @Override public boolean initializeCore() { return true; }
+            @Override public boolean stopAndSave() { stopCalls.incrementAndGet(); return true; }
+            @Override public EmulatorSessionOwner.StopResult stopAndSaveResult() {
+                stopCalls.incrementAndGet();
+                return new EmulatorSessionOwner.StopResult(
+                        VirtualSdGenerationStore.Outcome.COMMITTED, false, true);
+            }
+            @Override public boolean startLoops(long runToken) { return true; }
+            @Override public void unloadGame() { unloadCalls.incrementAndGet(); }
+            @Override public void shutdownCore() { shutdownCalls.incrementAndGet(); }
+        };
+        EmulatorSessionOwner.HostToken token = owner.attach(
+                EmulatorSessionOwner.Console.DS, host, new SessionReceiptStore(root));
+        assertTrue(owner.initialize(token));
+        assertTrue(open(owner, token, GAME_A).opened);
+        assertTrue(owner.resume(token));
+
+        assertFalse(owner.pause(token));
+        assertEquals(VirtualSdGenerationStore.Outcome.COMMITTED, owner.lastStopResult(token).outcome);
+        assertFalse(owner.closeHost(token));
+        assertFalse(owner.closeHost(token));
+        assertEquals("a terminal store result cannot be published twice by closeHost", 1, stopCalls.get());
+        assertEquals("native state is not unloaded until quiescence is proven", 0, unloadCalls.get());
+        assertEquals("native state is not shut down while a frame worker may still be live", 0,
+                shutdownCalls.get());
     }
 
     @Test public void loaderRuntimeWithoutMessageCannotBeTreatedAsSuccessfulOpen() throws Exception {
@@ -529,6 +647,56 @@ public final class EmulatorSessionOwnerTest {
         assertEquals(SessionReceiptStore.State.PAUSED,
                 owner.readReceipt(EmulatorSessionOwner.Console.GBA, GAME_A).state);
         assertTrue(owner.resume(token));
+    }
+
+    @Test public void quiescedLegacyCloseCreatesAutoCheckpointAndRetriesAfterPausedFailure() throws Exception {
+        Path directRoot = temporary.newFolder().toPath();
+        EmulatorSessionOwner directOwner = new EmulatorSessionOwner();
+        FakeHost directHost = new FakeHost();
+        directHost.checkpointStore = new CheckpointStore(directRoot.resolve("checkpoints"));
+        directHost.checkpointIdentity = checkpointIdentity(GAME_A);
+        directHost.checkpointCapture = CheckpointStore.Capture.supported(1,
+                new byte[]{1, 2, 3}, new byte[]{4, 5});
+        EmulatorSessionOwner.HostToken directToken = attach(directOwner,
+                directRoot.resolve("receipts"), EmulatorSessionOwner.Console.GBA, directHost);
+        assertTrue(directOwner.initialize(directToken));
+        assertTrue(open(directOwner, directToken, GAME_A).opened);
+        assertTrue(directOwner.resume(directToken));
+        assertTrue("a clean legacy stop is sufficient to close and checkpoint the host",
+                directOwner.closeHost(directToken));
+        assertEquals(1, directHost.checkpointCaptures.get());
+        assertEquals(1, directHost.checkpointStore.listValid(directHost.checkpointIdentity).stream()
+                .filter(record -> record.kind == CheckpointStore.Kind.AUTO).count());
+
+        Path retryRoot = temporary.newFolder().toPath();
+        AtomicReference<Boolean> failOnce = new AtomicReference<>(true);
+        CheckpointStore retryStore = new CheckpointStore(retryRoot.resolve("checkpoints"),
+                CheckpointStoreTest::sync, path -> Long.MAX_VALUE, point -> {
+                    if (point == CheckpointStore.FaultPoint.AFTER_TEMP_WRITE &&
+                            failOnce.compareAndSet(true, false))
+                        throw new IOException("injected first AUTO capture failure");
+                });
+        EmulatorSessionOwner retryOwner = new EmulatorSessionOwner();
+        FakeHost retryHost = new FakeHost();
+        retryHost.checkpointStore = retryStore;
+        retryHost.checkpointIdentity = checkpointIdentity(GAME_A);
+        retryHost.checkpointCapture = CheckpointStore.Capture.supported(1,
+                new byte[]{6, 7}, new byte[]{8, 9});
+        EmulatorSessionOwner.HostToken retryToken = attach(retryOwner,
+                retryRoot.resolve("receipts"), EmulatorSessionOwner.Console.GBA, retryHost);
+        assertTrue(retryOwner.initialize(retryToken));
+        assertTrue(open(retryOwner, retryToken, GAME_A).opened);
+        assertTrue(retryOwner.resume(retryToken));
+        assertTrue(retryOwner.pause(retryToken));
+        assertEquals("legacy boolean stop remains quiescence-only", null,
+                retryOwner.lastStopResult(retryToken).outcome);
+        assertEquals(0, retryStore.listValid(retryHost.checkpointIdentity).stream()
+                .filter(record -> record.kind == CheckpointStore.Kind.AUTO).count());
+        assertTrue("close retries a transient AUTO capture failure after the already paused session",
+                retryOwner.closeHost(retryToken));
+        assertEquals(2, retryHost.checkpointCaptures.get());
+        assertEquals(1, retryStore.listValid(retryHost.checkpointIdentity).stream()
+                .filter(record -> record.kind == CheckpointStore.Kind.AUTO).count());
     }
 
     @Test public void repeatedGameSwitchesKeepManualAndAutomaticRecordsIndependent() throws Exception {

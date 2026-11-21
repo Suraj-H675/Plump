@@ -5,6 +5,7 @@ No personal saves, ROMs, APKs, devices, network, or machine-state replay.
 """
 import ctypes as ct
 import hashlib
+import os
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 import sys
@@ -16,7 +17,8 @@ FIXTURE_ROM = {
 }
 CORE_FILE = {
     'gba': ROOT/'app/build/p4-a-work/mgba-host/mgba_libretro.so',
-    'ds': ROOT/'app/build/p3-melonds-host/src/libretro/melondsds_libretro.so',
+    'ds': Path(os.environ.get('PLUMP_P4_LEGACY_DS_CORE',
+                           str(ROOT/'app/build/p3-melonds-host/src/libretro/melondsds_libretro.so'))),
 }
 HARNESS = SourceFileLoader('p4d4_pinned_harness', str(ROOT/'tests/roms/verify-p4-c-checkpoint.py')).load_module()
 

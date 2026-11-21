@@ -18,7 +18,7 @@ root="$(mktemp -d "$repo/app/build/p4-d4-acceptance-XXXXXXXX")"
 classes="$root/classes"
 mkdir -p "$classes"
 javac --release 17 -d "$classes" \
-    app/src/main/java/dev/plump/emulator/{GameSaveStore,CheckpointStore,HistoricalBranchStore,ActiveTimelineStore,NativeSavePromotionStore,EmulatorSessionOwner,SessionReceiptStore}.java \
+    app/src/main/java/dev/plump/emulator/{GameSaveStore,CheckpointStore,HistoricalBranchStore,ActiveTimelineStore,NativeSavePromotionStore,EmulatorSessionOwner,SessionReceiptStore,StorageCapacity,VirtualSdGenerationStore}.java \
     tests/host/{PromotionD4HostCli,PromotionD4HardKillProbe}.java
 export PYTHONDONTWRITEBYTECODE=1
 host=dev.plump.emulator.PromotionD4HostCli

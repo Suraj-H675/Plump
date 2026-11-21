@@ -49,6 +49,8 @@ javac --release 17 -d "$PLUMP_P4_D_JAVA_CLASSES" \
     "$root/app/src/main/java/dev/plump/emulator/ActiveTimelineStore.java" \
     "$root/app/src/main/java/dev/plump/emulator/NativeSavePromotionStore.java" \
     "$root/app/src/main/java/dev/plump/emulator/SessionReceiptStore.java" \
+    "$root/app/src/main/java/dev/plump/emulator/StorageCapacity.java" \
+    "$root/app/src/main/java/dev/plump/emulator/VirtualSdGenerationStore.java" \
     "$root/app/src/main/java/dev/plump/emulator/EmulatorSessionOwner.java" \
     "$root/tests/host/JournalCli.java" \
     "$root/tests/host/ActiveTimelineHostCli.java"

@@ -31,6 +31,7 @@ final class SessionReceiptStore {
         BEFORE_RENAME,
         AFTER_RENAME,
         BEFORE_DIRECTORY_FSYNC,
+        DURING_DIRECTORY_FSYNC,
         AFTER_DIRECTORY_FSYNC
     }
 
@@ -187,7 +188,7 @@ final class SessionReceiptStore {
             moved = true;
             faults.hit(Failpoint.AFTER_RENAME);
             faults.hit(Failpoint.BEFORE_DIRECTORY_FSYNC);
-            fsyncDirectory(directory);
+            fsyncDirectory(directory, faults);
             faults.hit(Failpoint.AFTER_DIRECTORY_FSYNC);
             return new ReadResult(state, new Receipt(console, gameId, state, generation), false);
         } finally {
@@ -197,6 +198,13 @@ final class SessionReceiptStore {
 
     private static void fsyncDirectory(Path directory) throws IOException {
         try (FileChannel channel = FileChannel.open(directory, StandardOpenOption.READ)) {
+            channel.force(true);
+        }
+    }
+
+    private static void fsyncDirectory(Path directory, FaultInjector faults) throws IOException {
+        try (FileChannel channel = FileChannel.open(directory, StandardOpenOption.READ)) {
+            faults.hit(Failpoint.DURING_DIRECTORY_FSYNC);
             channel.force(true);
         }
     }
